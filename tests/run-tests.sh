@@ -866,6 +866,75 @@ case_disjoint_merge_is_not_an_issue() {
     end
 }
 
+# Extras with their own video stay on their own disk: reported, not blocked.
+case_extras_on_their_own_disk_are_left_in_place() {
+    begin extras-on-their-own-disk-are-left-in-place
+    make_disks 2
+    local m1="$CASE/disk1/Data/Movies/Alpha" m2="$CASE/disk2/Data/Movies/Alpha"
+    mkdir -p "$m1" "$m2/Featurettes"
+    : > "$m1/Alpha.mkv"
+    : > "$m2/Featurettes/making-of.mkv"
+    : > "$m2/Featurettes/notes.txt"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exit 0"                        [ "$rc" -eq 0 ]
+    assert "says left in place"            has "Left in place: Alpha/Featurettes"
+    assert "does not block a live run"     lacks "Manual inspection required"
+    assert "still prints the go-ahead"     has "No issues found"
+    end
+}
+
+# Loose episodes at the show root plus a season elsewhere need no human.
+case_loose_episodes_and_a_season_are_not_a_conflict() {
+    begin loose-episodes-and-a-season-are-not-a-conflict
+    make_disks 2
+    local s1="$CASE/disk1/Data/TV_Shows/Live Action/Delta"
+    local s2="$CASE/disk2/Data/TV_Shows/Live Action/Delta"
+    mkdir -p "$s1" "$s2/Season 02"
+    : > "$s1/Delta.S00E01.mkv"
+    : > "$s2/Season 02/S02E01.mkv"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    assert "no conflict"      lacks "Manual inspection required"
+    assert "go-ahead printed" has "No issues found"
+    end
+}
+
+# The four counts are always printed, and say nothing was moved in a dry run.
+case_report_counts_are_printed() {
+    begin report-counts-are-printed
+    make_disks 2
+    build_alpha
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    assert "counts the moves"       has "REPORT: 3 file(s) to move"
+    assert "counts the skips"       has "REPORT: 0 unit(s) skipped"
+    assert "counts left in place"   has "REPORT: 0 file(s) left in place"
+    assert "counts duplicates"      has "REPORT: 0 file(s) already on the master"
+    end
+}
+
+# A show whose own loose episodes sit on two disks is a conflict, but its
+# seasons are separate units and must still gather.
+case_conflicted_show_still_gathers_its_seasons() {
+    begin conflicted-show-still-gathers-its-seasons
+    make_disks 2
+    local s1="$CASE/disk1/Data/TV_Shows/Live Action/Mix"
+    local s2="$CASE/disk2/Data/TV_Shows/Live Action/Mix"
+    mkdir -p "$s1/Season 02" "$s2/Season 02"
+    : > "$s1/Mix.S00E01.mkv"; : > "$s2/Mix.S00E02.mkv"
+    : > "$s2/Season 02/S02E01.mkv"; : > "$s1/Season 02/S02E01.srt"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exits 1"                     [ "$rc" -eq 1 ]
+    assert "names the show"              has "Conflicting: Mix on disk1, disk2"
+    assert "season still gathered"       has "GATHER: Mix/Season 02 -> $CASE/disk2"
+    assert "season srt planned"          has "MOVE: Mix/Season 02/S02E01.srt"
+    end
+}
+
 # ---------------------------------------------------------------- logging
 
 case_dry_run_writes_a_log_and_nothing_else() {
@@ -972,6 +1041,10 @@ case_dry_run_says_safe_to_go_live
 case_dry_run_reports_conflicts_before_live
 case_dry_run_reports_folders_without_video
 case_disjoint_merge_is_not_an_issue
+case_extras_on_their_own_disk_are_left_in_place
+case_loose_episodes_and_a_season_are_not_a_conflict
+case_report_counts_are_printed
+case_conflicted_show_still_gathers_its_seasons
 
 printf '\n# %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

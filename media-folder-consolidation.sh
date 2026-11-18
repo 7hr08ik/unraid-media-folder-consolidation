@@ -185,9 +185,10 @@ declare -a PLAN_ROOT=()
 declare -A PAIR_COUNT=()   # "<src>" 0x1f <dst> -> planned files
 declare -A UNIT_FILES=()   # "<root>/<unit>" -> non-video files seen
 declare -A UNIT_MOVING=()  # "<root>/<unit>" -> non-video files planned
+declare -A LEFT_IN_PLACE=() # "<root>/<unit>" -> "<disk>" 0x1f "<unit>", reported
 
 DUPLICATES=0
-LEFT_IN_PLACE=0
+SKIPPED_FILES=0
 MOVED=0
 
 # Count the video files each directory holds, so the disk with the most video
@@ -300,10 +301,11 @@ resolve_masters() {
 
     # Every unit below a top-level folder: the disk holding most of its video,
     # or a conflict when its video is on two disks. Ties go to the earliest
-    # configured disk, as they do above.
+    # configured disk, as they do above. A conflicted top-level folder does not
+    # stop this: its seasons are separate units and still gather, only the
+    # files that resolve to the top itself are held back.
     while IFS= read -r -d '' unit; do
         top=${unit%%/*}
-        [ -z "${CONFLICT["$root/$top"]:-}" ] || continue
         best=""
         best_count=0
         disks=""
@@ -324,34 +326,53 @@ resolve_masters() {
         fi
         if [ -n "$best" ]; then
             UNIT_MASTER["$root/$unit"]=$best
+            # Video on a disk other than the show's own majority: the unit's
+            # files stay where they are. Informational, never an issue.
+            if [ -n "${TOP_MASTER["$root/$top"]:-}" ] && [ "$best" != "${TOP_MASTER["$root/$top"]}" ]; then
+                LEFT_IN_PLACE["$root/$unit"]="$best"$'\x1f'"$unit"
+            fi
         fi
     done < <(printf '%s\0' "${units[@]}" | sort -z)
     return 0
 }
 
 # Add every non-video file that belongs on another disk to the plan. A video is
-# never planned: it is the anchor the other files gather around.
+# never planned: it is the anchor the other files gather around. A file whose
+# own unit is fine follows that unit even when its top-level folder is
+# conflicted; only the files that resolve to the conflicted folder itself stay.
 index_files() {
-    local disk=$1 root=$2 rel top unit master
+    local disk=$1 root=$2 rel top unit master dir
+    # Every file in a directory resolves to the same unit, so the lookup runs
+    # once per directory: a command substitution per file cost ~0.3 ms, about
+    # 17 s of the run on the real library's 28k metadata files.
+    local -A unit_cache=()
     while IFS= read -r -d '' rel; do
-        top=$(top_of "$rel")
-        if [ -n "${CONFLICT["$root/$top"]:-}" ]; then
-            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
-            continue
+        top=${rel%%/*}
+        dir=${rel%/*}
+        [ "$dir" = "$rel" ] && dir="."
+        if [ -n "${unit_cache[$dir]+set}" ]; then
+            unit=${unit_cache[$dir]}
+        else
+            unit=$(unit_of "$root" "$rel") || unit=""
+            unit_cache["$dir"]=$unit
         fi
-        if ! unit=$(unit_of "$root" "$rel"); then
-            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+        if [ -z "$unit" ]; then
+            # Directly under the configured root: not part of a movie or show.
+            SKIPPED_FILES=$((SKIPPED_FILES + 1))
             continue
         fi
         if [ -n "${CONFLICT["$root/$unit"]:-}" ]; then
-            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+            SKIPPED_FILES=$((SKIPPED_FILES + 1))
             continue
         fi
-        if [ -z "${TOP_MASTER["$root/$top"]:-}" ]; then
-            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+        master=${UNIT_MASTER["$root/$unit"]:-${TOP_MASTER["$root/$top"]:-}}
+        if [ -z "$master" ]; then
+            SKIPPED_FILES=$((SKIPPED_FILES + 1))
             continue
         fi
-        master=${UNIT_MASTER["$root/$unit"]:-${TOP_MASTER["$root/$top"]}}
+        # Counted before the master check, so a unit whose files already sit on
+        # its own disk still reports how many stayed there.
+        UNIT_FILES["$root/$unit"]=$(( ${UNIT_FILES["$root/$unit"]:-0} + 1 ))
         [ "$master" = "$disk" ] && continue
         if [ -e "$master/$root/$rel" ]; then
             DUPLICATES=$((DUPLICATES + 1))
@@ -367,7 +388,6 @@ index_files() {
         PLAN_UNIT+=("$unit")
         PLAN_ROOT+=("$root")
         PAIR_COUNT["$disk"$'\x1f'"$master"]=$(( ${PAIR_COUNT["$disk"$'\x1f'"$master"]:-0} + 1 ))
-        UNIT_FILES["$root/$unit"]=$(( ${UNIT_FILES["$root/$unit"]:-0} + 1 ))
         UNIT_MOVING["$root/$unit"]=$(( ${UNIT_MOVING["$root/$unit"]:-0} + 1 ))
     done < <(find "$disk/$root" -type f ! \( "${VIDEO_FIND[@]}" \) -printf '%P\0' 2>/dev/null)
     return 0
@@ -508,19 +528,38 @@ run_plan() {
     return 0
 }
 
-# The four numbers the owner reads at the end of a run.
+# The four numbers the owner reads at the end of a run, then one line per unit
+# whose video sits on a disk other than its show's majority. Those files stay
+# where they are: expected, never an issue, never an exit-code change.
 print_report() {
-    local mode=$1 moved
+    local mode=$1 moved key disk unit n total=0
+    local -a lines=()
+
     if [ "$mode" = "dry" ]; then
         moved="${#PLAN_REL[@]} file(s) to move"
     else
         moved="$MOVED file(s) moved"
     fi
+
+    for key in "${!LEFT_IN_PLACE[@]}"; do
+        n=$(( ${UNIT_FILES[$key]:-0} - ${UNIT_MOVING[$key]:-0} ))
+        [ "$n" -gt 0 ] || continue
+        total=$(( total + n ))
+        disk=${LEFT_IN_PLACE[$key]%%$'\x1f'*}
+        unit=${LEFT_IN_PLACE[$key]#*$'\x1f'}
+        lines+=("Left in place: $unit  (video on ${disk##*/}, $n file(s) stay there)")
+    done
+
     echo
     echo "REPORT: $moved"
     echo "REPORT: $(( ${#CONFLICT[@]} + ${#REPORT_NO_VIDEO[@]} )) unit(s) skipped for manual inspection  ($(( ${#CONFLICT[@]} )) conflict, ${#REPORT_NO_VIDEO[@]} no video)"
-    echo "REPORT: $LEFT_IN_PLACE file(s) left in place"
+    echo "REPORT: $(( SKIPPED_FILES + total )) file(s) left in place"
     echo "REPORT: $DUPLICATES file(s) already on the master, left on their own disk"
+
+    if [ "${#lines[@]}" -gt 0 ]; then
+        echo
+        printf '%s\n' "${lines[@]}" | sort
+    fi
 }
 
 # ----------------------------------------------------------
