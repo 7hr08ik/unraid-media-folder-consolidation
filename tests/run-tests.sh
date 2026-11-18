@@ -519,7 +519,7 @@ case_skips_season_split_across_drives() {
 }
 
 # Seasons on different disks are siblings, not a split: each season is its own
-# unit and neither is a conflict. 1,000+ shows in the library look like this.
+# unit and neither is a conflict.
 case_seasons_stay_on_their_own_disks() {
     begin seasons-stay-on-their-own-disks
     make_disks 2
