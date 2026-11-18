@@ -1,5 +1,9 @@
 # AI Template files
 AGENTS.md
+.codegraph/
+.opencode/
+docs/
+openspec/
 
 # Run logs (the script writes outside the repo by default)
 *.log
