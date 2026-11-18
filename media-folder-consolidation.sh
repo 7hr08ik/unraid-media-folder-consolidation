@@ -440,86 +440,117 @@ print_plan() {
     return 0
 }
 
-# Move one unit's planned files. A non-zero rsync means part of them did not
-# arrive: say so, leave the source intact, and let the run exit non-zero.
-transfer_group() {
-    local src=$1 dst=$2 unit=$3 root=$4 list=$5
-    local source="$src/$root" destination="$dst/$root"
+# Scratch list for the batch in flight. The trap is installed on first use and
+# SCRATCH is global, because a function's locals are gone by the time EXIT runs.
+SCRATCH=""
+FAILED_FILES=0
 
-    mkdir -p "$destination"
-
-    if ! rsync -avh --from0 --files-from="$list" \
-            --ignore-existing --remove-source-files \
-            "$source/" "$destination/"; then
-        echo "FAILED:  $source"
-        echo "         Transfer did not complete - source left in place"
-        return 1
-    fi
-
-    if [ -d "$source/$unit" ]; then
-        find "$source/$unit" -depth -type d -empty -delete
-    fi
+# Delete directories left empty by a move, deepest first, in chunks so a large
+# batch cannot exceed the argument limit. -depth plus -empty means a directory
+# that still holds a duplicate or an unmoved file survives, and no configured
+# root is ever passed (every path ends below one).
+prune_dirs() {
+    local -a chunk=()
+    local d
+    for d in "$@"; do
+        chunk+=("$d")
+        if [ "${#chunk[@]}" -ge 500 ]; then
+            find "${chunk[@]}" -depth -type d -empty -delete 2>/dev/null
+            chunk=()
+        fi
+    done
+    [ "${#chunk[@]}" -gt 0 ] && find "${chunk[@]}" -depth -type d -empty -delete 2>/dev/null
     return 0
 }
 
-# Execute the plan: one rsync per (source disk, target disk, unit) group, fed a
-# NUL-delimited file list so any name survives. Grouped by sorting the plan.
-run_plan() {
-    local rec prefix idx rest src dst unit root tmp n
-    local -a records=()
+# Move one pair's files in a single rsync. --remove-source-files deletes only
+# what arrived; --ignore-existing is the guard against a stale copy overwriting
+# the master's metadata. A non-zero status means some files did not arrive, so
+# the source stays and the run exits non-zero.
+run_batch() {
+    local src=$1 dst=$2 root=$3
+    shift 3
+    local source="$src/$root" destination="$dst/$root" rel n failed=0 moved=0
+
+    mkdir -p "$destination"
+    n=$(tr -cd '\0' < "$SCRATCH/list" | wc -c)
+
+    if rsync -avh --from0 --files-from="$SCRATCH/list" \
+            --ignore-existing --remove-source-files \
+            "$source/" "$destination/"; then
+        MOVED=$((MOVED + n))
+        [ "$#" -gt 0 ] && prune_dirs "$@"
+        return 0
+    fi
+
+    # Anything still at the source is a failed move: name it, leave it, and let
+    # the run report a non-zero exit.
+    while IFS= read -r -d '' rel; do
+        if [ -e "$source/$rel" ]; then
+            failed=$((failed + 1))
+            echo "FAILED:  $source/$rel"
+        else
+            moved=$((moved + 1))
+        fi
+    done < "$SCRATCH/list"
+
+    MOVED=$((MOVED + moved))
+    FAILED_FILES=$((FAILED_FILES + failed))
+    failures=$((failures + 1))
+    [ "$#" -gt 0 ] && prune_dirs "$@"
+    return 1
+}
+
+# Walk the plan once, in sorted order, and hand each (source, target, root)
+# group to run_batch. The list is built in the loop, never through a pipeline:
+# a `... | sort` would run the loop in a subshell and lose the directories the
+# prune needs.
+run_batches() {
+    local rec prefix idx rest src dst root rel dir
+    local -a records=() dirs=()
+    local -A seen=()
 
     [ "${#PLAN_REL[@]}" -gt 0 ] || return 0
 
-    if ! tmp=$(mktemp); then
-        echo "ABORT: cannot create a temporary file for the batch list"
-        exit 2
+    if [ -z "$SCRATCH" ]; then
+        SCRATCH=$(mktemp -d) || { echo "ABORT: cannot create a scratch directory"; exit 2; }
+        trap 'rm -rf "$SCRATCH"' EXIT
     fi
 
     while IFS= read -r -d '' rec; do
         records+=("$rec")
     done < <(
         for idx in "${!PLAN_REL[@]}"; do
-            printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\0' \
-                "${PLAN_SRC[idx]}" "${PLAN_DST[idx]}" "${PLAN_UNIT[idx]}" \
-                "${PLAN_ROOT[idx]}" "$idx"
-        done | sort -z -t $'\x1f' -k1,4
+            printf '%s\x1f%s\x1f%s\x1f%s\0' \
+                "${PLAN_SRC[idx]}" "${PLAN_DST[idx]}" "${PLAN_ROOT[idx]}" "$idx"
+        done | sort -z -t $'\x1f' -k1,3
     )
 
     prefix=""
-    n=0
     for rec in "${records[@]}"; do
         idx=${rec##*$'\x1f'}
         if [ "${rec%$'\x1f'*}" != "$prefix" ]; then
-            if [ -n "$prefix" ]; then
-                if transfer_group "$src" "$dst" "$unit" "$root" "$tmp"; then
-                    MOVED=$((MOVED + n))
-                else
-                    failures=$((failures + 1))
-                fi
-            fi
+            [ -n "$prefix" ] && run_batch "$src" "$dst" "$root" "${dirs[@]}"
             prefix=${rec%$'\x1f'*}
             src=${prefix%%$'\x1f'*}
             rest=${prefix#*$'\x1f'}
             dst=${rest%%$'\x1f'*}
-            rest=${rest#*$'\x1f'}
-            unit=${rest%%$'\x1f'*}
             root=${rest#*$'\x1f'}
-            : > "$tmp"
-            n=0
+            : > "$SCRATCH/list"
+            dirs=()
+            seen=()
         fi
-        printf '%s\0' "${PLAN_REL[idx]}" >> "$tmp"
-        n=$((n + 1))
+        rel=${PLAN_REL[idx]}
+        printf '%s\0' "$rel" >> "$SCRATCH/list"
+        if [ "$rel" != "${rel##*/}" ]; then
+            dir="$src/$root/${rel%/*}"
+            if [ -z "${seen[$dir]:-}" ]; then
+                seen["$dir"]=1
+                dirs+=("$dir")
+            fi
+        fi
     done
-
-    if [ -n "$prefix" ]; then
-        if transfer_group "$src" "$dst" "$unit" "$root" "$tmp"; then
-            MOVED=$((MOVED + n))
-        else
-            failures=$((failures + 1))
-        fi
-    fi
-
-    rm -f "$tmp"
+    [ -n "$prefix" ] && run_batch "$src" "$dst" "$root" "${dirs[@]}"
     return 0
 }
 
@@ -627,7 +658,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     print_report dry
 else
     print_plan live
-    run_plan
+    run_batches
     print_report live
 fi
 

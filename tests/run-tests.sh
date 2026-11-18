@@ -511,6 +511,69 @@ case_prunes_only_the_moved_folder() {
     end
 }
 
+# One rsync per disk pair, not one per folder: the stub counts its invocations.
+case_one_rsync_per_disk_pair() {
+    begin one-rsync-per-disk-pair
+    make_disks 3
+    local d1="$CASE/disk1/Data/Movies" d2="$CASE/disk2/Data/Movies" d3="$CASE/disk3/Data/Movies"
+    # Two movies whose video is on disk1 and whose metadata is on disk2, plus a
+    # third pair disk3 -> disk2: three units, two batches.
+    mkdir -p "$d1/One" "$d2/One" "$d1/Two" "$d2/Two" "$d2/Three" "$d3/Three"
+    : > "$d1/One/One.mkv"; : > "$d2/One/One.nfo"
+    : > "$d1/Two/Two.mkv"; : > "$d2/Two/Two.nfo"
+    : > "$d2/Three/Three.mkv"; : > "$d3/Three/Three.nfo"
+    mkdir -p "$CASE/bin"
+    printf '#!/bin/bash\necho "$@" >> "%s/calls.log"\nexec "%s" "$@"\n' \
+        "$CASE" "$(command -v rsync)" > "$CASE/bin/rsync"
+    chmod +x "$CASE/bin/rsync"
+    prepare "$CASE" 0
+    run_and_log "$CASE" "$CASE/bin"
+    assert "two batches only"  [ "$(wc -l < "$CASE/calls.log")" -eq 2 ]
+    assert "one nfo gathered"  exists "$d1/One/One.nfo"
+    assert "two nfo gathered"  exists "$d1/Two/Two.nfo"
+    assert "three nfo gathered" exists "$d2/Three/Three.nfo"
+    end
+}
+
+# A failed batch keeps every source and the run still processes later pairs.
+case_failed_batch_keeps_sources_and_continues() {
+    begin failed-batch-keeps-sources-and-continues
+    make_disks 3
+    mkdir -p "$CASE/disk1/Data/Movies/A" "$CASE/disk2/Data/Movies/A" \
+             "$CASE/disk2/Data/Movies/B" "$CASE/disk3/Data/Movies/B"
+    : > "$CASE/disk1/Data/Movies/A/A.mkv"; : > "$CASE/disk2/Data/Movies/A/A.nfo"
+    : > "$CASE/disk3/Data/Movies/B/B.mkv"; : > "$CASE/disk2/Data/Movies/B/B.nfo"
+    mkdir -p "$CASE/bin"
+    printf '#!/bin/bash\ncase "$*" in *disk1*) exit 23;; esac\nexec "%s" "$@"\n' \
+        "$(command -v rsync)" > "$CASE/bin/rsync"
+    chmod +x "$CASE/bin/rsync"
+    prepare "$CASE" 0
+    run_and_log "$CASE" "$CASE/bin"
+    local rc=$?
+    assert "exits 1"                [ "$rc" -eq 1 ]
+    assert "failed source kept"     exists "$CASE/disk2/Data/Movies/A/A.nfo"
+    assert "other pair still ran"   exists "$CASE/disk3/Data/Movies/B/B.nfo"
+    assert "other source consumed"  missing "$CASE/disk2/Data/Movies/B/B.nfo"
+    end
+}
+
+# Opposite directions in one run must not lose either file.
+case_opposite_direction_batches() {
+    begin opposite-direction-batches
+    make_disks 2
+    local d1="$CASE/disk1/Data/Movies" d2="$CASE/disk2/Data/Movies"
+    mkdir -p "$d1/A" "$d2/A" "$d1/B" "$d2/B"
+    : > "$d1/A/A.mkv"; : > "$d2/A/A.nfo"
+    : > "$d2/B/B.mkv"; : > "$d1/B/B.nfo"
+    prepare "$CASE" 0
+    run_and_log "$CASE"
+    assert "A.nfo gathered"  exists "$d1/A/A.nfo"
+    assert "B.nfo gathered"  exists "$d2/B/B.nfo"
+    assert "A video intact"  exists "$d1/A/A.mkv"
+    assert "B video intact"  exists "$d2/B/B.mkv"
+    end
+}
+
 # The same season on two drives is a genuine conflict — merging would leave one
 # copy behind — so skip that season, name it, and ask for a human. A dry run
 # must withhold the go-ahead, and the season's metadata must not move either.
@@ -1025,6 +1088,9 @@ case_failed_rsync_is_not_success
 case_invalid_dry_run_refuses_to_run
 case_absent_disk_is_not_fatal
 case_prunes_only_the_moved_folder
+case_one_rsync_per_disk_pair
+case_failed_batch_keeps_sources_and_continues
+case_opposite_direction_batches
 case_skips_season_split_across_drives
 case_seasons_stay_on_their_own_disks
 case_dry_run_reports_no_conflict_for_sibling_seasons
