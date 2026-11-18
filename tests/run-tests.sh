@@ -447,7 +447,27 @@ case_failed_rsync_is_not_success() {
 
     assert "exits non-zero"            [ "$rc" -ne 0 ]
     assert "does not claim completion" lacks "Live consolidation completed."
+    assert "names the failed batch"    has "Live consolidation finished with 1 failed batch(es) and 1 file(s) not moved."
     assert "source files left in place" exists "$CASE/disk2/Data/Movies/Zeta/Zeta.srt"
+    end
+}
+
+# A skip is not a failure: the live run completes, exits 0, and names what it
+# left alone. The owner reads this list instead of re-running to find it.
+case_live_run_exits_zero_with_skips() {
+    begin live-run-exits-zero-with-skips
+    make_disks 2
+    mkdir -p "$CASE/disk1/Data/Movies/Beta" "$CASE/disk2/Data/Movies/Beta"
+    : > "$CASE/disk1/Data/Movies/Beta/Beta.S01E01.mkv"
+    : > "$CASE/disk2/Data/Movies/Beta/Beta.S01E02.mkv"
+    : > "$CASE/disk2/Data/Movies/Beta/Beta.nfo"
+    prepare "$CASE" 0
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exit 0"                  [ "$rc" -eq 0 ]
+    assert "names the block"         has "SKIPPED UNITS"
+    assert "names the conflict"      has "Data/Movies/Beta - video files directly in it on disk1, disk2"
+    assert "leaves metadata alone"   exists "$CASE/disk2/Data/Movies/Beta/Beta.nfo"
     end
 }
 
@@ -1112,6 +1132,7 @@ case_empty_extension_list_refuses_to_run
 case_handles_spaces_in_paths
 case_never_overwrites_master_metadata
 case_failed_rsync_is_not_success
+case_live_run_exits_zero_with_skips
 case_invalid_dry_run_refuses_to_run
 case_absent_disk_is_not_fatal
 case_prunes_only_the_moved_folder

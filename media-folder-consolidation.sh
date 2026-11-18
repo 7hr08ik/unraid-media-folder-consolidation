@@ -560,7 +560,9 @@ run_batches() {
 
 # The four numbers the owner reads at the end of a run, then one line per unit
 # whose video sits on a disk other than its show's majority. Those files stay
-# where they are: expected, never an issue, never an exit-code change.
+# where they are: expected, never an issue, never an exit-code change. A live run
+# also names every unit it skipped, because the run has finished by then and the
+# list is the only record of what it did not touch.
 print_report() {
     local mode=$1 moved key disk unit n total=0
     local -a lines=()
@@ -588,6 +590,14 @@ print_report() {
     if [ "${#lines[@]}" -gt 0 ]; then
         echo
         printf '%s\n' "${lines[@]}" | sort
+    fi
+
+    if [ "$mode" = "live" ] &&
+        { [ "${#REPORT_CONFLICTS[@]}" -ne 0 ] || [ "${#REPORT_NO_VIDEO[@]}" -ne 0 ]; }; then
+        echo
+        echo "SKIPPED UNITS"
+        echo "These units were left untouched; their files are still on their own drives:"
+        printf '%s\n' "${REPORT_CONFLICTS[@]}" "${REPORT_NO_VIDEO[@]}" | sort
     fi
 }
 
@@ -700,7 +710,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 
 else
     if [ "$failures" -ne 0 ]; then
-        echo "Live consolidation finished with $failures failed folder(s)."
+        echo "Live consolidation finished with $failures failed batch(es) and $FAILED_FILES file(s) not moved."
         echo "See the FAILED lines above; re-run once the cause is fixed."
         echo "=========================================="
         exit 1
