@@ -879,7 +879,9 @@ case_extras_on_their_own_disk_are_left_in_place() {
     run_and_log "$CASE"
     local rc=$?
     assert "exit 0"                        [ "$rc" -eq 0 ]
-    assert "says left in place"            has "Left in place: Alpha/Featurettes"
+    assert "says left in place"            has "Left in place: Alpha/Featurettes  (video on disk2, 1 file(s) stay there)"
+    assert "counts left in place"          has "REPORT: 1 file(s) left in place"
+    assert "extras stay on their disk"     exists "$m2/Featurettes/notes.txt"
     assert "does not block a live run"     lacks "Manual inspection required"
     assert "still prints the go-ahead"     has "No issues found"
     end
@@ -898,6 +900,7 @@ case_loose_episodes_and_a_season_are_not_a_conflict() {
     run_and_log "$CASE"
     assert "no conflict"      lacks "Manual inspection required"
     assert "go-ahead printed" has "No issues found"
+    assert "season left in place" has "Left in place: Delta/Season 02  (video on disk2, 0 file(s) stay there)"
     end
 }
 

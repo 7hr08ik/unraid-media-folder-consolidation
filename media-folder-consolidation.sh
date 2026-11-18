@@ -109,11 +109,6 @@ is_video() {
     [ -n "${VIDEO_EXT_SET[${ext,,}]:-}" ]
 }
 
-# The first path component of a relative path.
-top_of() {
-    printf '%s' "${1%%/*}"
-}
-
 # The depth clamp that unit_of and the conflict pass share: a unit is a movie
 # folder or a season folder, never deeper, so Season 01/Disc 1 belongs to
 # Season 01 and a disc split is its season's conflict. Sets CLAMPED to the
@@ -543,7 +538,6 @@ print_report() {
 
     for key in "${!LEFT_IN_PLACE[@]}"; do
         n=$(( ${UNIT_FILES[$key]:-0} - ${UNIT_MOVING[$key]:-0} ))
-        [ "$n" -gt 0 ] || continue
         total=$(( total + n ))
         disk=${LEFT_IN_PLACE[$key]%%$'\x1f'*}
         unit=${LEFT_IN_PLACE[$key]#*$'\x1f'}
