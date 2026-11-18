@@ -534,6 +534,8 @@ case_seasons_stay_on_their_own_disks() {
     assert "exit 0"                 [ "$rc" -eq 0 ]
     assert "season 1 mkv stays"     exists "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01/S01E01.mkv"
     assert "season 2 mkv stays"     exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.mkv"
+    assert "season 2 srt stays"     exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.srt"
+    assert "no stray srt on disk1"  missing "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.srt"
     assert "no season is a conflict" lacks "Manual inspection required"
     end
 }
@@ -555,6 +557,27 @@ case_season_metadata_follows_its_season() {
     run_and_log "$CASE"
     assert "season.nfo goes to season 2's disk" exists "$base2/Season 02/season.nfo"
     assert "show nfo stays on the majority disk" exists "$base1/Delta.nfo"
+    end
+}
+
+# The plan names the season, not the show, and a dry run still moves nothing.
+case_dry_run_plans_disjoint_season_merge() {
+    begin dry-run-plans-disjoint-season-merge
+    make_disks 2
+    local base1="$CASE/disk1/Data/TV_Shows/Live Action/Delta"
+    local base2="$CASE/disk2/Data/TV_Shows/Live Action/Delta"
+    mkdir -p "$base1/Season 01" "$base1/Season 02" "$base2/Season 02"
+    : > "$base1/Season 01/S01E01.mkv"
+    : > "$base1/Season 01/S01E02.mkv"
+    : > "$base1/Season 01/S01E03.mkv"
+    : > "$base2/Season 02/S02E01.mkv"
+    : > "$base1/Season 02/season.nfo"
+    : > "$base1/Delta.nfo"
+    prepare "$CASE" default
+    run_and_log "$CASE"
+    assert "plans the season unit"     has "GATHER: Delta/Season 02 -> $CASE/disk2"
+    assert "lists the season nfo move" has "MOVE: Delta/Season 02/season.nfo"
+    assert "moved nothing"             missing "$base2/Season 02/season.nfo"
     end
 }
 
@@ -868,6 +891,7 @@ case_prunes_only_the_moved_folder
 case_skips_season_split_across_drives
 case_seasons_stay_on_their_own_disks
 case_season_metadata_follows_its_season
+case_dry_run_plans_disjoint_season_merge
 case_disc_folder_is_the_unit
 case_detects_ogm_and_divx
 case_consolidates_other_vids
