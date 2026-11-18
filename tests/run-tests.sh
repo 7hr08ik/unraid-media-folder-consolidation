@@ -247,6 +247,7 @@ case_skips_media_on_multiple_disks() {
     assert "exit 0"                    [ "$rc" -eq 0 ]
     assert "says it skipped"           has "SKIP: Video files found on multiple drives"
     assert "asks for manual inspection" has "Manual inspection required"
+    assert "report names the folder"   has "Conflicting: Beta on disk1, disk2"
     assert "second mkv untouched"      exists "$CASE/disk2/Data/Movies/Beta/Beta.S01E02.mkv"
     assert "metadata untouched"        exists "$CASE/disk2/Data/Movies/Beta/Beta.nfo"
     end
@@ -268,6 +269,21 @@ case_skips_folder_without_media() {
     assert "says it skipped"  has "SKIP: No video files found"
     assert "names the formats" has "looked for: mkv"
     assert "nothing moved"    exists "$CASE/disk2/Data/Movies/Gamma/poster.jpg"
+    end
+}
+
+# A folder with nothing in it at all is the same no-video case, and the report
+# must name it: an empty movie folder is a broken library entry, not a no-op.
+case_empty_folder_is_reported_as_no_video() {
+    begin empty-folder-is-reported-as-no-video
+    make_disks 2
+    mkdir -p "$CASE/disk1/Data/Movies/Empty"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exits 1"              [ "$rc" -eq 1 ]
+    assert "names the folder"     has "Data/Movies/Empty"
+    assert "says it has no video" has "SKIP: No video files found"
     end
 }
 
@@ -496,25 +512,28 @@ case_prunes_only_the_moved_folder() {
 }
 
 # The same season on two drives is a genuine conflict — merging would leave one
-# copy behind — so skip, name the season, and ask for a human. 137 folders in
-# the library this was developed against look like this.
+# copy behind — so skip that season, name it, and ask for a human. A dry run
+# must withhold the go-ahead, and the season's metadata must not move either.
 case_skips_season_split_across_drives() {
     begin skips-season-split-across-drives
     make_disks 2
-    mkdir -p "$CASE/disk1/Data/TV_Shows/Live Action/Epsilon/Season 01" \
-             "$CASE/disk2/Data/TV_Shows/Live Action/Epsilon/Season 01"
-    : > "$CASE/disk1/Data/TV_Shows/Live Action/Epsilon/Season 01/E01.mkv"
-    : > "$CASE/disk2/Data/TV_Shows/Live Action/Epsilon/Season 01/E02.mkv"
+    local s1="$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01"
+    local s2="$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 01"
+    mkdir -p "$s1" "$s2"
+    : > "$s1/Delta - S01E01.mkv"
+    : > "$s2/Delta - S01E02.mkv"
+    : > "$s1/season.nfo"
 
-    prepare "$CASE" 0
+    prepare "$CASE" 1
     run_and_log "$CASE"
     local rc=$?
 
-    assert "exit 0"                     [ "$rc" -eq 0 ]
-    assert "says it skipped"            has "SKIP: Video files found on multiple drives"
-    assert "names the split season"      has "Conflicting: Season 01"
+    assert "exits 1"                    [ "$rc" -eq 1 ]
+    assert "names the split season"     has "Delta/Season 01"
     assert "asks for manual inspection" has "Manual inspection required"
-    assert "both copies untouched"      exists "$CASE/disk2/Data/TV_Shows/Live Action/Epsilon/Season 01/E02.mkv"
+    assert "plans nothing for it"       lacks "GATHER: Delta/Season 01"
+    assert "disk1 mkv untouched"        exists "$s1/Delta - S01E01.mkv"
+    assert "disk2 mkv untouched"        exists "$s2/Delta - S01E02.mkv"
     end
 }
 
@@ -537,6 +556,23 @@ case_seasons_stay_on_their_own_disks() {
     assert "season 2 srt stays"     exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.srt"
     assert "no stray srt on disk1"  missing "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.srt"
     assert "no season is a conflict" lacks "Manual inspection required"
+    end
+}
+
+# The same layout on a dry run must not be reported as an issue: two sibling
+# seasons on two disks are two units, not one split unit.
+case_dry_run_reports_no_conflict_for_sibling_seasons() {
+    begin dry-run-reports-no-conflict-for-sibling-seasons
+    make_disks 2
+    mkdir -p "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01" \
+             "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02"
+    : > "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01/S01E01.mkv"
+    : > "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.mkv"
+    : > "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.srt"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    assert "gives the go-ahead"  has "No issues found"
+    assert "no conflict"         lacks "Manual inspection required"
     end
 }
 
@@ -581,22 +617,50 @@ case_dry_run_plans_disjoint_season_merge() {
     end
 }
 
-# A disc folder is the unit when the season root holds no video.
-case_disc_folder_is_the_unit() {
-    begin disc-folder-is-the-unit
+# A season whose video sits in disc folders is still one unit: metadata at the
+# season root follows the season, not the disc folder that happens to hold the
+# episodes. The spec's example: Show/Season 04/Disc 1 belongs to Season 04.
+case_disc_folder_metadata_follows_the_season() {
+    begin disc-folder-metadata-follows-the-season
     make_disks 2
     local s1="$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01"
     local s2="$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 01"
-    local s3="$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02"
-    mkdir -p "$s1/Disc 1" "$s2" "$s3"
-    : > "$s1/Disc 1/S01E01.mkv"
+    mkdir -p "$s1/Disc 1" "$s2"
+    : > "$s1/Disc 1/Delta - S01E01.mkv"
     : > "$s2/season.nfo"
-    : > "$s3/S02E01.mkv"
-    : > "$s3/S02E02.mkv"
     prepare "$CASE" 0
     run_and_log "$CASE"
-    assert "season.nfo follows its own season" exists "$s1/season.nfo"
-    assert "season 2 video stays"              exists "$s3/S02E01.mkv"
+    local rc=$?
+    assert "exit 0"                 [ "$rc" -eq 0 ]
+    assert "nfo follows its season" exists "$s1/season.nfo"
+    assert "no stray nfo on disk2"  missing "$s2/season.nfo"
+    end
+}
+
+# A season split into disc folders is one unit on two disks: the season is a
+# conflict, and its sibling season is still gathered onto its own video's disk.
+case_disc_split_is_a_season_conflict() {
+    begin disc-split-is-a-season-conflict
+    make_disks 2
+    local base1="$CASE/disk1/Data/TV_Shows/Live Action/Delta"
+    local base2="$CASE/disk2/Data/TV_Shows/Live Action/Delta"
+    mkdir -p "$base1/Season 01/Disc 1" "$base2/Season 01/Disc 2" \
+             "$base1/Season 02" "$base2/Season 02"
+    : > "$base1/Season 01/Disc 1/Delta - S01E01.mkv"
+    : > "$base2/Season 01/Disc 2/Delta - S01E02.mkv"
+    : > "$base2/Season 01/season.nfo"
+    : > "$base1/Season 02/Delta - S02E01.mkv"
+    : > "$base1/Season 02/season.nfo"
+    : > "$base2/Season 02/Delta - S02E01.srt"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exits 1"                  [ "$rc" -eq 1 ]
+    assert "names the season"         has "Delta/Season 01"
+    assert "manual inspection asked"  has "Manual inspection required"
+    assert "no season 01 plan"        lacks "GATHER: Delta/Season 01"
+    assert "season 02 still gathered" has "GATHER: Delta/Season 02"
+    assert "season 01 nfo untouched"  exists "$base2/Season 01/season.nfo"
     end
 }
 
@@ -877,6 +941,7 @@ case_already_consolidated_is_not_planned
 case_newline_in_filename_is_planned
 case_skips_media_on_multiple_disks
 case_skips_folder_without_media
+case_empty_folder_is_reported_as_no_video
 case_detects_uppercase_extension
 case_detects_other_video_formats
 case_two_formats_on_two_disks_skip
@@ -890,9 +955,11 @@ case_absent_disk_is_not_fatal
 case_prunes_only_the_moved_folder
 case_skips_season_split_across_drives
 case_seasons_stay_on_their_own_disks
+case_dry_run_reports_no_conflict_for_sibling_seasons
 case_season_metadata_follows_its_season
 case_dry_run_plans_disjoint_season_merge
-case_disc_folder_is_the_unit
+case_disc_split_is_a_season_conflict
+case_disc_folder_metadata_follows_the_season
 case_detects_ogm_and_divx
 case_consolidates_other_vids
 case_handles_unicode_and_punctuation

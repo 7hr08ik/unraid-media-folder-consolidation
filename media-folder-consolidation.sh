@@ -109,33 +109,55 @@ is_video() {
     [ -n "${VIDEO_EXT_SET[${ext,,}]:-}" ]
 }
 
-# The directory part of a relative path; "." when the file sits at the root.
-dir_of() {
-    local rel=$1
-    [ "$rel" = "${rel##*/}" ] && { printf '.'; return 0; }
-    printf '%s' "${rel%/*}"
-}
-
 # The first path component of a relative path.
 top_of() {
     printf '%s' "${1%%/*}"
 }
 
+# The depth clamp that unit_of and the conflict pass share: a unit is a movie
+# folder or a season folder, never deeper, so Season 01/Disc 1 belongs to
+# Season 01 and a disc split is its season's conflict. Sets CLAMPED to the
+# clamped path; fails for the top-level folder itself, which is no unit.
+clamp_unit() {
+    local rel=$1 top rest
+    top=${rel%%/*}
+    rest=${rel#*/}
+    [ "$rest" = "$rel" ] && return 1
+    if [ "$rest" = "${rest%%/*}" ]; then
+        CLAMPED=$rel
+    else
+        CLAMPED="$top/${rest%%/*}"
+    fi
+    return 0
+}
+
+# True when the directory holds video on any configured disk.
+has_video() {
+    local dir=$1 disk
+    for disk in "${DISKS[@]}"; do
+        [ -n "${SUB_VIDEO["$dir"$'\x1f'"$disk"]:-}" ] && return 0
+    done
+    return 1
+}
+
 # The unit a file belongs to, relative to the configured root: the nearest
-# directory below the top-level folder that holds video anywhere in its
-# subtree, or the top-level folder itself when nothing below it does. A file
-# directly under the root belongs to no unit: it is not part of a movie or show.
+# directory at or below the clamp that holds video anywhere in its subtree, or
+# the top-level folder itself when nothing below it does. A file directly under
+# the root belongs to no unit: it is not part of a movie or show.
 unit_of() {
-    local root=$1 rel=$2 cand
-    [ "$rel" = "${rel%%/*}" ] && return 1
-    # Inlined dir_of: this runs once per non-video file, and a command
-    # substitution per step costs ~2 ms each (measured 100 s per 50k files).
-    cand=${rel%/*}
-    while [ "$cand" != "${rel%%/*}" ]; do
-        [ -n "${UNIT_MASTER["$root/$cand"]:-}" ] && { printf '%s' "$cand"; return 0; }
+    local root=$1 rel=$2 cand top
+    top=${rel%%/*}
+    [ "$rel" = "$top" ] && return 1
+    if clamp_unit "${rel%/*}"; then
+        cand=$CLAMPED
+    else
+        cand=$top
+    fi
+    while [ "$cand" != "$top" ]; do
+        has_video "$root/$cand" && { printf '%s' "$cand"; return 0; }
         cand=${cand%/*}
     done
-    printf '%s' "${rel%%/*}"
+    printf '%s' "$top"
 }
 
 # ----------------------------------------------------------
@@ -144,14 +166,14 @@ unit_of() {
 
 # Keys that name a disk join two parts with 0x1f, which cannot appear in a
 # configured path, so no real folder name can collide with the separator.
-declare -A TOPS=()         # top-level folder name -> 1
-declare -A TOP_PRESENT=()  # "<root>/<top>" 0x1f <disk> -> 1
-declare -A TOP_VIDEO=()    # "<root>/<top>" 0x1f <disk> -> video files
-declare -A SUB_VIDEO=()    # "<root>/<dir>" 0x1f <disk> -> video files below it
-declare -A GROUP_VIDEO=()  # "<root>/<top>" 0x1f <child> 0x1f <disk> -> 1
-declare -A TOP_MASTER=()   # "<root>/<top>" -> disk holding most of it
-declare -A UNIT_MASTER=()  # "<root>/<unit>" -> disk the unit belongs on
-declare -A CONFLICT=()     # "<root>/<top>" -> 1, a human must decide
+declare -A TOPS=()          # top-level folder name -> 1
+declare -A TOP_PRESENT=()   # "<root>/<top>" 0x1f <disk> -> 1
+declare -A TOP_VIDEO=()     # "<root>/<top>" 0x1f <disk> -> video files
+declare -A TOP_OWN_VIDEO=() # "<root>/<top>" 0x1f <disk> -> 1, video directly in it
+declare -A SUB_VIDEO=()     # "<root>/<dir>" 0x1f <disk> -> video files below it
+declare -A TOP_MASTER=()    # "<root>/<top>" -> disk holding most of it
+declare -A UNIT_MASTER=()   # "<root>/<unit>" -> disk the unit belongs on
+declare -A CONFLICT=()      # "<root>/<unit>" -> 1, a human must decide
 
 # The plan. PLAN_REL is relative to the configured root, which is what a MOVE:
 # line shows; PLAN_ROOT keeps the root needed to build the real source path.
@@ -171,38 +193,70 @@ MOVED=0
 # Count the video files each directory holds, so the disk with the most video
 # for a movie or show becomes its master. One find pass per disk root.
 index_videos() {
-    local disk=$1 root=$2 rel dir top anc rest group
+    local disk=$1 root=$2 rel dir top anc
     while IFS= read -r -d '' rel; do
-        dir=$(dir_of "$rel")
+        # Inlined dir_of: this runs once per file and once per ancestor level,
+        # and a command substitution per step costs ~2 ms each.
+        if [ "$rel" = "${rel##*/}" ]; then
+            dir=.
+        else
+            dir=${rel%/*}
+        fi
         top=${rel%%/*}
-        rest=${rel#*/}
-        group="(top level)"
-        if [ "$rest" != "${rest%%/*}" ]; then
-            group=${rest%%/*}
+        if [ "$dir" = "$top" ]; then
+            TOP_OWN_VIDEO["$root/$top"$'\x1f'"$disk"]=1
         fi
         anc=$dir
         while :; do
             SUB_VIDEO["$root/$anc"$'\x1f'"$disk"]=$(( ${SUB_VIDEO["$root/$anc"$'\x1f'"$disk"]:-0} + 1 ))
             [ "$anc" = "$top" ] && break
             [ "$anc" = "." ] && break
-            anc=$(dir_of "$anc")
+            anc=${anc%/*}
         done
         TOP_VIDEO["$root/$top"$'\x1f'"$disk"]=$(( ${TOP_VIDEO["$root/$top"$'\x1f'"$disk"]:-0} + 1 ))
-        GROUP_VIDEO["$root/$top"$'\x1f'"$group"$'\x1f'"$disk"]=1
     done < <(find "$disk/$root" -type f \( "${VIDEO_FIND[@]}" \) -printf '%P\0' 2>/dev/null)
     return 0
 }
 
-# Pick the disk each top-level folder belongs on, or name the folder a human
-# must resolve. A child folder holding video on two disks is ambiguous: one
-# copy would have to win, so the whole show is skipped rather than guessed at.
-# Then pick the disk each video-bearing folder below the top belongs on.
+# Name a unit whose video sits on more than one disk. A unit is at most one
+# level below its top-level folder, so its own name is the last component.
+report_conflict() {
+    local root=$1 unit=$2 disks=$3 top=${2%%/*}
+    echo "SKIP: Video files found on multiple drives"
+    echo "       Conflicting: $unit on $disks"
+    echo "       Manual inspection required"
+    CONFLICT["$root/$unit"]=1
+    if [ "$unit" = "$top" ]; then
+        REPORT_CONFLICTS+=("  $root/$top - video files directly in it on $disks")
+    else
+        REPORT_CONFLICTS+=("  $root/$top - ${unit#*/} on $disks")
+    fi
+}
+
+# Pick the disk each unit belongs on, and name the units a human must resolve.
+# A unit whose own video sits on two or more disks cannot have its files follow
+# it, so only that unit is skipped and reported; its siblings are gathered as
+# usual. A unit is a movie folder or a season folder, never deeper: a season
+# split into disc folders is one unit on two disks, and that is a conflict.
 resolve_masters() {
-    local root=$1 top disk count best best_count key rest group dir rel
-    local -a conflicts=()
+    local root=$1 top disk count best best_count key dir rel unit disks present n
     local -a units=()
-    local -A group_count=()
     local -A unit_seen=()
+    local -A unit_disks=()
+
+    # One pass over the subtree counts, each directory clamped to its unit:
+    # Season 01/Disc 1 and Disc 2 both land on Season 01, while sibling seasons
+    # land on themselves.
+    for key in "${!SUB_VIDEO[@]}"; do
+        [ -n "${SUB_VIDEO[$key]}" ] || continue
+        dir=${key%$'\x1f'*}
+        disk=${key##*$'\x1f'}
+        rel=${dir#"$root/"}
+        clamp_unit "$rel" || continue
+        [ -n "${unit_seen[$CLAMPED]:-}" ] || units+=("$CLAMPED")
+        unit_seen["$CLAMPED"]=1
+        unit_disks["$CLAMPED"$'\x1f'"$disk"]=1
+    done
 
     for top in "${!TOPS[@]}"; do
         best=""
@@ -216,7 +270,7 @@ resolve_masters() {
         done
 
         if [ -z "$best" ]; then
-            local present=""
+            present=""
             for disk in "${DISKS[@]}"; do
                 [ -n "${TOP_PRESENT["$root/$top"$'\x1f'"$disk"]:-}" ] || continue
                 present="${present:+$present, }${disk##*/}"
@@ -226,39 +280,17 @@ resolve_masters() {
             continue
         fi
 
-        group_count=()
-        for key in "${!GROUP_VIDEO[@]}"; do
-            rest=${key#"$root/$top"$'\x1f'}
-            [ "$rest" != "$key" ] || continue
-            group=${rest%$'\x1f'*}
-            group_count["$group"]=$(( ${group_count[$group]:-0} + 1 ))
+        # Episodes directly in the movie folder put that folder — the unit — on
+        # two disks. Seasons below it are separate units and do not count.
+        disks=""
+        n=0
+        for disk in "${DISKS[@]}"; do
+            [ -n "${TOP_OWN_VIDEO["$root/$top"$'\x1f'"$disk"]:-}" ] || continue
+            disks="${disks:+$disks, }${disk##*/}"
+            n=$(( n + 1 ))
         done
-
-        conflicts=()
-        for group in "${!group_count[@]}"; do
-            [ "${group_count[$group]}" -gt 1 ] && conflicts+=("$group")
-        done
-
-        if [ "${#conflicts[@]}" -gt 0 ]; then
-            mapfile -t conflicts < <(printf '%s\n' "${conflicts[@]}" | sort)
-            local detail=""
-            for group in "${conflicts[@]}"; do
-                local disks=""
-                for disk in "${DISKS[@]}"; do
-                    [ -n "${GROUP_VIDEO["$root/$top"$'\x1f'"$group"$'\x1f'"$disk"]:-}" ] || continue
-                    disks="${disks:+$disks, }${disk##*/}"
-                done
-                detail="${detail:+$detail; }$group on $disks"
-            done
-            local listed=""
-            for group in "${conflicts[@]}"; do
-                listed="${listed:+$listed, }$group"
-            done
-            echo "SKIP: Video files found on multiple drives"
-            echo "       Conflicting: $listed"
-            echo "       Manual inspection required"
-            CONFLICT["$root/$top"]=1
-            REPORT_CONFLICTS+=("  $root/$top - $detail")
+        if [ "$n" -gt 1 ]; then
+            report_conflict "$root" "$top" "$disks"
             continue
         fi
 
@@ -266,34 +298,34 @@ resolve_masters() {
         UNIT_MASTER["$root/$top"]=$best
     done
 
-    # Every directory below a top-level folder that holds video anywhere in its
-    # subtree is a unit of its own: a season's metadata follows its own episodes
-    # and sibling seasons never compete for the show's majority disk. Ties go to
-    # the earliest configured disk, as they do above.
-    for key in "${!SUB_VIDEO[@]}"; do
-        dir=${key%$'\x1f'*}
-        rel=${dir#"$root/"}
-        [ "$rel" != "$dir" ] || continue
-        [ "$rel" != "${rel%%/*}" ] || continue
-        [ -n "${unit_seen[$dir]:-}" ] && continue
-        unit_seen["$dir"]=1
-        units+=("$dir")
-    done
-
-    for dir in "${units[@]}"; do
+    # Every unit below a top-level folder: the disk holding most of its video,
+    # or a conflict when its video is on two disks. Ties go to the earliest
+    # configured disk, as they do above.
+    while IFS= read -r -d '' unit; do
+        top=${unit%%/*}
+        [ -z "${CONFLICT["$root/$top"]:-}" ] || continue
         best=""
         best_count=0
+        disks=""
+        n=0
         for disk in "${DISKS[@]}"; do
-            count=${SUB_VIDEO["$dir"$'\x1f'"$disk"]:-0}
+            count=${SUB_VIDEO["$root/$unit"$'\x1f'"$disk"]:-0}
             if [ "$count" -gt "$best_count" ]; then
                 best=$disk
                 best_count=$count
             fi
+            [ -n "${unit_disks["$unit"$'\x1f'"$disk"]:-}" ] || continue
+            disks="${disks:+$disks, }${disk##*/}"
+            n=$(( n + 1 ))
         done
-        if [ -n "$best" ]; then
-            UNIT_MASTER["$dir"]=$best
+        if [ "$n" -gt 1 ]; then
+            report_conflict "$root" "$unit" "$disks"
+            continue
         fi
-    done
+        if [ -n "$best" ]; then
+            UNIT_MASTER["$root/$unit"]=$best
+        fi
+    done < <(printf '%s\0' "${units[@]}" | sort -z)
     return 0
 }
 
@@ -303,7 +335,15 @@ index_files() {
     local disk=$1 root=$2 rel top unit master
     while IFS= read -r -d '' rel; do
         top=$(top_of "$rel")
+        if [ -n "${CONFLICT["$root/$top"]:-}" ]; then
+            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+            continue
+        fi
         if ! unit=$(unit_of "$root" "$rel"); then
+            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+            continue
+        fi
+        if [ -n "${CONFLICT["$root/$unit"]:-}" ]; then
             LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
             continue
         fi
@@ -536,8 +576,8 @@ for relative_path in "${FOLDERS[@]}"; do
     TOPS=()
     TOP_PRESENT=()
     TOP_VIDEO=()
+    TOP_OWN_VIDEO=()
     SUB_VIDEO=()
-    GROUP_VIDEO=()
     TOP_MASTER=()
     UNIT_MASTER=()
 
