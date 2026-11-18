@@ -85,10 +85,12 @@ for ext in "${VIDEO_EXTS[@]:1}"; do
     VIDEO_FIND+=(-o -iname "*.$ext")
 done
 
-# Extension -> 1, so is_video() is a lookup instead of a process per file.
+# Extension, lowercased -> 1, so is_video() is a lookup instead of a process per
+# file. Lowercasing here matches the extension is_video() reads from the path,
+# so an uppercase entry in VIDEO_EXTS still arms the guard.
 declare -A VIDEO_EXT_SET=()
 for ext in "${VIDEO_EXTS[@]}"; do
-    VIDEO_EXT_SET["$ext"]=1
+    VIDEO_EXT_SET["${ext,,}"]=1
 done
 
 # Problems a dry run cannot resolve on its own. Collected during the scan and
@@ -159,8 +161,8 @@ unit_of() {
 # Index: which disk holds the video, and which files follow it
 # ----------------------------------------------------------
 
-# Keys that name a disk join two parts with 0x1f, which cannot appear in a
-# configured path, so no real folder name can collide with the separator.
+# Keys that name a disk join two parts with 0x1f, the separator every split in
+# this script reads.
 declare -A TOPS=()          # top-level folder name -> 1
 declare -A TOP_PRESENT=()   # "<root>/<top>" 0x1f <disk> -> 1
 declare -A TOP_VIDEO=()     # "<root>/<top>" 0x1f <disk> -> video files
@@ -299,6 +301,9 @@ resolve_masters() {
     # configured disk, as they do above. A conflicted top-level folder does not
     # stop this: its seasons are separate units and still gather, only the
     # files that resolve to the top itself are held back.
+    # printf with no arguments still writes one empty record, so an empty list
+    # is handled here instead of sorting a phantom unit.
+    [ "${#units[@]}" -gt 0 ] || return 0
     while IFS= read -r -d '' unit; do
         top=${unit%%/*}
         best=""
@@ -423,6 +428,8 @@ print_plan() {
             echo "GATHER: $unit -> ${PLAN_DST[idx]}  ($count file(s))"
             last="$root/$unit"
         fi
+        # Live mode leaves the per-file detail to rsync -avh, which already
+        # prints one line per transfer; a MOVE: line here would duplicate it.
         if [ "$mode" = "dry" ]; then
             echo "MOVE: $rel"
         fi
@@ -463,6 +470,36 @@ prune_dirs() {
     return 0
 }
 
+# Scratch counters for classify_batch; each call resets them and the caller
+# folds the results into the globals straight away.
+CLASS_MOVED=0
+CLASS_DUPLICATES=0
+CLASS_FAILED=0
+
+# Decide what happened to every planned entry by inspecting both sides:
+#   destination present, source gone     -> moved
+#   destination present, source present  -> --ignore-existing left it behind
+#   destination absent                   -> it never arrived: name it, count it
+# A vanished source root lands in the last case for every entry, so a batch
+# that moved nothing can no longer be reported as a success.
+classify_batch() {
+    local source=$1 destination=$2 rel
+    CLASS_MOVED=0
+    CLASS_DUPLICATES=0
+    CLASS_FAILED=0
+    while IFS= read -r -d '' rel; do
+        if [ ! -e "$destination/$rel" ]; then
+            CLASS_FAILED=$((CLASS_FAILED + 1))
+            echo "FAILED:  $source/$rel"
+        elif [ -e "$source/$rel" ]; then
+            CLASS_DUPLICATES=$((CLASS_DUPLICATES + 1))
+        else
+            CLASS_MOVED=$((CLASS_MOVED + 1))
+        fi
+    done < "$SCRATCH/list"
+    return 0
+}
+
 # Move one pair's files in a single rsync. --remove-source-files deletes only
 # what arrived; --ignore-existing is the guard against a stale copy overwriting
 # the master's metadata. A non-zero status means some files did not arrive, so
@@ -470,35 +507,38 @@ prune_dirs() {
 run_batch() {
     local src=$1 dst=$2 root=$3
     shift 3
-    local source="$src/$root" destination="$dst/$root" rel n failed=0 moved=0
+    local source="$src/$root" destination="$dst/$root" status=0
 
-    mkdir -p "$destination"
-    n=$(tr -cd '\0' < "$SCRATCH/list" | wc -c)
-
-    if rsync -avh --from0 --files-from="$SCRATCH/list" \
-            --ignore-existing --remove-source-files \
-            "$source/" "$destination/"; then
-        MOVED=$((MOVED + n))
-        [ "$#" -gt 0 ] && prune_dirs "$@"
-        return 0
+    # A destination disk that dropped mid-run must not be recreated: on Unraid
+    # mkdir -p would build the path on the RAM-backed root, rsync would write
+    # there, and --remove-source-files would delete the only copies. $dst is
+    # the disk root; $destination is the path the mkdir below creates.
+    if [ ! -d "$dst" ]; then
+        failures=$((failures + 1))
+        echo "FAILED:  $dst is not mounted"
+        return 1
     fi
 
-    # Anything still at the source is a failed move: name it, leave it, and let
-    # the run report a non-zero exit.
-    while IFS= read -r -d '' rel; do
-        if [ -e "$source/$rel" ]; then
-            failed=$((failed + 1))
-            echo "FAILED:  $source/$rel"
-        else
-            moved=$((moved + 1))
-        fi
-    done < "$SCRATCH/list"
+    mkdir -p "$destination"
 
-    MOVED=$((MOVED + moved))
-    FAILED_FILES=$((FAILED_FILES + failed))
-    failures=$((failures + 1))
+    rsync -avh --from0 --files-from="$SCRATCH/list" \
+        --ignore-existing --remove-source-files \
+        "$source/" "$destination/" || status=1
+
+    classify_batch "$source" "$destination"
+    MOVED=$((MOVED + CLASS_MOVED))
+    DUPLICATES=$((DUPLICATES + CLASS_DUPLICATES))
+
+    # A file at neither side did not arrive, whatever rsync said it did.
+    if [ "$status" -ne 0 ] || [ "$CLASS_FAILED" -ne 0 ]; then
+        FAILED_FILES=$((FAILED_FILES + CLASS_FAILED))
+        failures=$((failures + 1))
+        [ "$#" -gt 0 ] && prune_dirs "$@"
+        return 1
+    fi
+
     [ "$#" -gt 0 ] && prune_dirs "$@"
-    return 1
+    return 0
 }
 
 # Walk the plan once, in sorted order, and hand each (source, target, root)
@@ -564,7 +604,7 @@ run_batches() {
 # also names every unit it skipped, because the run has finished by then and the
 # list is the only record of what it did not touch.
 print_report() {
-    local mode=$1 moved key disk unit n total=0
+    local mode=$1 moved key disk unit n total=0 skipped
     local -a lines=()
 
     if [ "$mode" = "dry" ]; then
@@ -583,7 +623,8 @@ print_report() {
 
     echo
     echo "REPORT: $moved"
-    echo "REPORT: $(( ${#CONFLICT[@]} + ${#REPORT_NO_VIDEO[@]} )) unit(s) skipped for manual inspection  ($(( ${#CONFLICT[@]} )) conflict, ${#REPORT_NO_VIDEO[@]} no video)"
+    skipped=$(( ${#REPORT_CONFLICTS[@]} + ${#REPORT_NO_VIDEO[@]} ))
+    echo "REPORT: $skipped unit(s) skipped for manual inspection  ($(( ${#REPORT_CONFLICTS[@]} )) conflict, $(( ${#REPORT_NO_VIDEO[@]} )) no video)"
     echo "REPORT: $(( SKIPPED_FILES + total )) file(s) left in place"
     echo "REPORT: $DUPLICATES file(s) already on the master, left on their own disk"
 
@@ -711,7 +752,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
 else
     if [ "$failures" -ne 0 ]; then
         echo "Live consolidation finished with $failures failed batch(es) and $FAILED_FILES file(s) not moved."
-        echo "See the FAILED lines above; re-run once the cause is fixed."
+        # Only point at FAILED lines that exist: a batch stopped before rsync
+        # (an unmounted destination) prints one for the disk, not for each file.
+        if [ "$FAILED_FILES" -ne 0 ]; then
+            echo "See the FAILED lines above; re-run once the cause is fixed."
+        fi
         echo "=========================================="
         exit 1
     fi

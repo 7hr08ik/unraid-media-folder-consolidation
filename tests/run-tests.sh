@@ -67,6 +67,10 @@ end() {
 
 has()    { grep -qF -- "$1" "$CASE/out.log"; }   # script printed this text
 lacks()  { ! grep -qF -- "$1" "$CASE/out.log"; } # script did not print it
+# contains <text> — the text appears contiguously, newlines included. grep -F
+# reads a newline in its pattern as an alternative, so it would accept a name
+# mangled to a space by matching one half.
+contains() { [[ "$(cat "$CASE/out.log")" == *"$1"* ]]; }
 exists() { [ -e "$1" ]; }
 missing() { [ ! -e "$1" ]; }
 
@@ -211,8 +215,10 @@ case_already_consolidated_is_not_planned() {
     : > "$CASE/disk1/Data/Movies/Alpha/poster.jpg"
     prepare "$CASE" 1
     run_and_log "$CASE"
-    assert "nothing to gather"   lacks "GATHER: Alpha"
-    assert "nothing to move"     lacks "MOVE: Alpha/poster.jpg"
+    assert "nothing to gather"      lacks "GATHER: Alpha"
+    assert "nothing to move"        lacks "MOVE: Alpha/poster.jpg"
+    assert "reports the empty plan" has "REPORT: 0 file(s) to move"
+    assert "reports no skips"       has "REPORT: 0 unit(s) skipped"
     end
 }
 
@@ -226,8 +232,10 @@ case_newline_in_filename_is_planned() {
     : > "$CASE/disk2/Data/Movies/Alpha/$odd"
     prepare "$CASE" 1
     run_and_log "$CASE"
-    assert "plan holds the newline name" bash -c \
-        'grep -qF "MOVE: Alpha/poster" "$1" && grep -qF "newline.jpg" "$1"' _ "$CASE/out.log"
+    # The joined name, not its two halves: a name mangled to a space would
+    # still satisfy two separate greps.
+    local want="MOVE: Alpha/poster"$'\n'"newline.jpg"
+    assert "plan holds the newline name" contains "$want"
     end
 }
 
@@ -380,7 +388,7 @@ case_empty_extension_list_refuses_to_run() {
     assert "list really emptied" grep -qF 'VIDEO_EXTS=()' "$CASE/under-test.sh"
     assert "exits non-zero"      [ "$rc" -ne 0 ]
     assert "says why"            has "ABORT: VIDEO_EXTS is empty"
-    assert "scans nothing"       lacks "Checking:"
+    assert "scans nothing"       lacks "Scanning:"
     end
 }
 
@@ -601,6 +609,34 @@ case_failed_batch_keeps_sources_and_continues() {
     assert "other pair still ran"   exists "$CASE/disk3/Data/Movies/B/B.nfo"
     assert "other source consumed"  missing "$CASE/disk2/Data/Movies/B/B.nfo"
     assert "scratch cleaned up"     [ -z "$(ls -A "$CASE/tmp")" ]
+    end
+}
+
+# A destination disk that drops between the plan and its batch must not be
+# recreated: mkdir -p on Unraid would build the path in RAM, rsync would write
+# there, and --remove-source-files would delete the only copies. The stub drops
+# disk3 while the first batch runs, so the second batch meets a missing disk.
+case_unmounted_destination_keeps_sources() {
+    begin unmounted-destination-keeps-sources
+    make_disks 3
+    mkdir -p "$CASE/disk1/Data/Movies/A" "$CASE/disk2/Data/Movies/A" \
+             "$CASE/disk2/Data/Movies/B" "$CASE/disk3/Data/Movies/B"
+    : > "$CASE/disk1/Data/Movies/A/A.mkv"; : > "$CASE/disk2/Data/Movies/A/A.nfo"
+    : > "$CASE/disk3/Data/Movies/B/B.mkv"; : > "$CASE/disk2/Data/Movies/B/B.nfo"
+    mkdir -p "$CASE/bin"
+    printf '#!/bin/bash\nrm -rf "%s/disk3"\nexec "%s" "$@"\n' \
+        "$CASE" "$(command -v rsync)" > "$CASE/bin/rsync"
+    chmod +x "$CASE/bin/rsync"
+    prepare "$CASE" 0
+    run_and_log "$CASE" "$CASE/bin"
+    local rc=$?
+    assert "exits 1"                 [ "$rc" -eq 1 ]
+    assert "names the missing disk"  has "FAILED:  $CASE/disk3 is not mounted"
+    assert "disk root not recreated" missing "$CASE/disk3"
+    assert "first batch still moved" exists "$CASE/disk1/Data/Movies/A/A.nfo"
+    assert "source survives"         exists "$CASE/disk2/Data/Movies/B/B.nfo"
+    assert "claims no lost files"    has "1 failed batch(es) and 0 file(s) not moved."
+    assert "no dangling FAILED cue"  lacks "See the FAILED lines above"
     end
 }
 
@@ -1077,6 +1113,24 @@ case_dry_run_writes_a_log_and_nothing_else() {
     end
 }
 
+# The dry run only reads: a stub rsync that records its own invocation must
+# never fire, however much work the plan holds.
+case_dry_run_calls_no_rsync() {
+    begin dry-run-calls-no-rsync
+    make_disks 2
+    build_alpha
+    mkdir -p "$CASE/bin"
+    printf '#!/bin/bash\n: > "%s/rsync-ran"\nexit 0\n' "$CASE" > "$CASE/bin/rsync"
+    chmod +x "$CASE/bin/rsync"
+    prepare "$CASE" default
+    run_and_log "$CASE" "$CASE/bin"
+    local rc=$?
+    assert "exit 0"             [ "$rc" -eq 0 ]
+    assert "had work to plan"   has "MOVE: Alpha/Alpha.nfo"
+    assert "never called rsync" missing "$CASE/rsync-ran"
+    end
+}
+
 case_log_captures_an_abort() {
     begin log-captures-abort
     make_disks 1
@@ -1139,6 +1193,7 @@ case_prunes_only_the_moved_folder
 case_prunes_a_parent_that_never_held_a_file
 case_one_rsync_per_disk_pair
 case_failed_batch_keeps_sources_and_continues
+case_unmounted_destination_keeps_sources
 case_opposite_direction_batches
 case_skips_season_split_across_drives
 case_seasons_stay_on_their_own_disks
@@ -1153,6 +1208,7 @@ case_handles_unicode_and_punctuation
 case_empty_stub_folder_is_skipped
 case_duplicate_ignore_file_does_not_block_merge
 case_dry_run_writes_a_log_and_nothing_else
+case_dry_run_calls_no_rsync
 case_log_captures_an_abort
 case_unusable_log_directory_aborts
 case_dry_run_says_safe_to_go_live

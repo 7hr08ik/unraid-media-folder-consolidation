@@ -65,7 +65,7 @@ LOG_DIR=/mnt/user/tmp
 3. When the run ends with `No issues found - safe to set DRY_RUN=0 and run live.`, set `DRY_RUN=0` and run once more.
 4. After a live run, check the output for `FAILED:`. A failed transfer is counted and the run exits non-zero so a scheduler notices; files not yet copied stay on the source and are retried on the next run.
 
-A live run ends with a `SKIPPED UNITS` list: units it left untouched because their video sits on two disks or because no configured video extension was found. A skip does not fail the run, so a scheduled run exits `0` with skips and the list is the record of what it did not touch.
+A live run ends with a `SKIPPED UNITS` list: units it left untouched because their video sits on two disks or because no configured video extension was found. The block is omitted when nothing was skipped. A skip does not fail the run, so a scheduled run exits `0` with skips and the list is the record of what it did not touch.
 
 ## Exit codes
 
@@ -88,7 +88,7 @@ A plain bash runner with no dependencies. Each case builds fake disks in a tempo
 - No free-space check. A live run can fill a disk; `rsync` then fails, every file it did not move is reported `FAILED:`, and the partial copy stays on the master.
 - Name matching is case-sensitive, so `Foo (2001)` and `foo (2001)` are two shows and never merge.
 - Symlinked directories are ignored: the scan matches real directories only.
-- Season detection reads the first path component below a show. Video placed directly in the show folder is reported as `(top level)`, and seasons nested deeper (`Season 01/Disc 1`) still resolve to `Season 01`.
+- Season detection reads the first path component below a show. Video placed directly in the show folder is reported as `video files directly in it on <disks>`, and seasons nested deeper (`Season 01/Disc 1`) still resolve to `Season 01`.
 - Copying between array disks is a copy followed by a delete, not a rename. An interrupted run leaves both copies.
 - Only extensions in `VIDEO_EXTS` count as video. A show in another container is skipped and named in the report.
 - A file present on both the master and a source disk is neither copied nor deleted: the master's copy wins and the duplicate stays on its source disk, so a folder can remain on two disks with the shared filenames left behind. The log shows such a source left in place; remove the duplicate by hand to bring the folder onto one disk.
@@ -96,7 +96,7 @@ A plain bash runner with no dependencies. Each case builds fake disks in a tempo
 
 ## Tested on
 
-A 42 TiB Jellyfin library: 54,188 files across six disks and 3,066 movie and show folders. A dry run over that tree left every file and directory in place: 2,871 folders had one master disk, 58 merged across disks, and 137 were refused because a season sits on two disks. Its decisions matched an independent re-implementation, with the only differences explained by folders deleted between the two snapshots. A live pass on a copy of the tree then moved 1,720 folder merges with no file lost.
+A 42 TiB Jellyfin library: 54,188 files across six disks and 3,066 movie and show folders. The figures that follow come from the earlier per-folder version of this script, not from the current one-`rsync`-per-disk-pair design: a dry run over that tree left every file and directory in place, with 2,871 folders on one master disk, 58 merged across disks, and 137 refused because a season sits on two disks. Its decisions matched an independent re-implementation, with the only differences explained by folders deleted between the two snapshots. A live pass on a copy of the tree then moved 1,720 folder merges with no file lost.
 
 ## Contributing
 
