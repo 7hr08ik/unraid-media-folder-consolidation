@@ -85,189 +85,369 @@ for ext in "${VIDEO_EXTS[@]:1}"; do
     VIDEO_FIND+=(-o -iname "*.$ext")
 done
 
+# Extension -> 1, so is_video() is a lookup instead of a process per file.
+declare -A VIDEO_EXT_SET=()
+for ext in "${VIDEO_EXTS[@]}"; do
+    VIDEO_EXT_SET["$ext"]=1
+done
+
 # Problems a dry run cannot resolve on its own. Collected during the scan and
 # reported together at the end, so one pass tells the owner everything to fix.
 REPORT_CONFLICTS=()
 REPORT_NO_VIDEO=()
 
 # ----------------------------------------------------------
-# Process a movie folder or TV show folder
+# Path helpers
 # ----------------------------------------------------------
 
-process_folder() {
+# A file is a video when its extension, compared case-insensitively, is one of
+# the configured formats. A name without an extension is not a video.
+is_video() {
+    local path=$1 ext
+    [ "$path" != "${path%.*}" ] || return 1
+    ext=${path##*.}
+    [ -n "${VIDEO_EXT_SET[${ext,,}]:-}" ]
+}
 
-    local relative_path="$1"
-    local folder_name="$2"
+# The directory part of a relative path; "." when the file sits at the root.
+dir_of() {
+    local rel=$1
+    [ "$rel" = "${rel##*/}" ] && { printf '.'; return 0; }
+    printf '%s' "${rel%/*}"
+}
 
-    local master=""
-    local video_drives=0
-    local folder_failed=0
-    local disk file key season owner present=""
-    local -a video_disks=()
+# The first path component of a relative path.
+top_of() {
+    printf '%s' "${1%%/*}"
+}
+
+# The unit a file belongs to, relative to the configured root. A file directly
+# under the root belongs to no unit: it is not part of a movie or a show.
+unit_of() {
+    local rel=$2
+    [ "$rel" = "${rel%%/*}" ] && return 1
+    printf '%s' "${rel%%/*}"
+}
+
+# ----------------------------------------------------------
+# Index: which disk holds the video, and which files follow it
+# ----------------------------------------------------------
+
+# Keys that name a disk join two parts with 0x1f, which cannot appear in a
+# configured path, so no real folder name can collide with the separator.
+declare -A TOPS=()         # top-level folder name -> 1
+declare -A TOP_PRESENT=()  # "<root>/<top>" 0x1f <disk> -> 1
+declare -A TOP_VIDEO=()    # "<root>/<top>" 0x1f <disk> -> video files
+declare -A SUB_VIDEO=()    # "<root>/<dir>" 0x1f <disk> -> video files below it
+declare -A GROUP_VIDEO=()  # "<root>/<top>" 0x1f <child> 0x1f <disk> -> 1
+declare -A TOP_MASTER=()   # "<root>/<top>" -> disk holding most of it
+declare -A UNIT_MASTER=()  # "<root>/<unit>" -> disk the unit belongs on
+declare -A CONFLICT=()     # "<root>/<top>" -> 1, a human must decide
+
+# The plan. PLAN_REL is relative to the configured root, which is what a MOVE:
+# line shows; PLAN_ROOT keeps the root needed to build the real source path.
+declare -a PLAN_SRC=()
+declare -a PLAN_DST=()
+declare -a PLAN_REL=()
+declare -a PLAN_UNIT=()
+declare -a PLAN_ROOT=()
+declare -A PAIR_COUNT=()   # "<src>" 0x1f <dst> -> planned files
+declare -A UNIT_FILES=()   # "<root>/<unit>" -> non-video files seen
+declare -A UNIT_MOVING=()  # "<root>/<unit>" -> non-video files planned
+
+DUPLICATES=0
+LEFT_IN_PLACE=0
+MOVED=0
+
+# Count the video files each directory holds, so the disk with the most video
+# for a movie or show becomes its master. One find pass per disk root.
+index_videos() {
+    local disk=$1 root=$2 rel dir top anc rest group
+    while IFS= read -r -d '' rel; do
+        dir=$(dir_of "$rel")
+        top=${rel%%/*}
+        rest=${rel#*/}
+        group="(top level)"
+        if [ "$rest" != "${rest%%/*}" ]; then
+            group=${rest%%/*}
+        fi
+        anc=$dir
+        while :; do
+            SUB_VIDEO["$root/$anc"$'\x1f'"$disk"]=$(( ${SUB_VIDEO["$root/$anc"$'\x1f'"$disk"]:-0} + 1 ))
+            [ "$anc" = "$top" ] && break
+            [ "$anc" = "." ] && break
+            anc=$(dir_of "$anc")
+        done
+        TOP_VIDEO["$root/$top"$'\x1f'"$disk"]=$(( ${TOP_VIDEO["$root/$top"$'\x1f'"$disk"]:-0} + 1 ))
+        GROUP_VIDEO["$root/$top"$'\x1f'"$group"$'\x1f'"$disk"]=1
+    done < <(find "$disk/$root" -type f \( "${VIDEO_FIND[@]}" \) -printf '%P\0' 2>/dev/null)
+    return 0
+}
+
+# Pick the disk each top-level folder belongs on, or name the folder a human
+# must resolve. A child folder holding video on two disks is ambiguous: one
+# copy would have to win, so the whole show is skipped rather than guessed at.
+resolve_masters() {
+    local root=$1 top disk count best best_count key rest group
+    local -a conflicts=()
+    local -A group_count=()
+
+    for top in "${!TOPS[@]}"; do
+        best=""
+        best_count=0
+        for disk in "${DISKS[@]}"; do
+            count=${TOP_VIDEO["$root/$top"$'\x1f'"$disk"]:-0}
+            if [ "$count" -gt "$best_count" ]; then
+                best=$disk
+                best_count=$count
+            fi
+        done
+
+        if [ -z "$best" ]; then
+            local present=""
+            for disk in "${DISKS[@]}"; do
+                [ -n "${TOP_PRESENT["$root/$top"$'\x1f'"$disk"]:-}" ] || continue
+                present="${present:+$present, }${disk##*/}"
+            done
+            echo "SKIP: No video files found in $top (looked for: ${VIDEO_EXTS[*]})"
+            REPORT_NO_VIDEO+=("  $root/$top - on ${present:-no configured disk}")
+            continue
+        fi
+
+        group_count=()
+        for key in "${!GROUP_VIDEO[@]}"; do
+            rest=${key#"$root/$top"$'\x1f'}
+            [ "$rest" != "$key" ] || continue
+            group=${rest%$'\x1f'*}
+            group_count["$group"]=$(( ${group_count[$group]:-0} + 1 ))
+        done
+
+        conflicts=()
+        for group in "${!group_count[@]}"; do
+            [ "${group_count[$group]}" -gt 1 ] && conflicts+=("$group")
+        done
+
+        if [ "${#conflicts[@]}" -gt 0 ]; then
+            mapfile -t conflicts < <(printf '%s\n' "${conflicts[@]}" | sort)
+            local detail=""
+            for group in "${conflicts[@]}"; do
+                local disks=""
+                for disk in "${DISKS[@]}"; do
+                    [ -n "${GROUP_VIDEO["$root/$top"$'\x1f'"$group"$'\x1f'"$disk"]:-}" ] || continue
+                    disks="${disks:+$disks, }${disk##*/}"
+                done
+                detail="${detail:+$detail; }$group on $disks"
+            done
+            local listed=""
+            for group in "${conflicts[@]}"; do
+                listed="${listed:+$listed, }$group"
+            done
+            echo "SKIP: Video files found on multiple drives"
+            echo "       Conflicting: $listed"
+            echo "       Manual inspection required"
+            CONFLICT["$root/$top"]=1
+            REPORT_CONFLICTS+=("  $root/$top - $detail")
+            continue
+        fi
+
+        TOP_MASTER["$root/$top"]=$best
+        UNIT_MASTER["$root/$top"]=$best
+    done
+    return 0
+}
+
+# Add every non-video file that belongs on another disk to the plan. A video is
+# never planned: it is the anchor the other files gather around.
+index_files() {
+    local disk=$1 root=$2 rel top unit master
+    while IFS= read -r -d '' rel; do
+        top=$(top_of "$rel")
+        if ! unit=$(unit_of "$root" "$rel"); then
+            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+            continue
+        fi
+        if [ -z "${TOP_MASTER["$root/$top"]:-}" ]; then
+            LEFT_IN_PLACE=$((LEFT_IN_PLACE + 1))
+            continue
+        fi
+        master=${UNIT_MASTER["$root/$unit"]:-${TOP_MASTER["$root/$top"]}}
+        [ "$master" = "$disk" ] && continue
+        if [ -e "$master/$root/$rel" ]; then
+            DUPLICATES=$((DUPLICATES + 1))
+            continue
+        fi
+        if is_video "$rel"; then
+            echo "SKIP: video file reached the plan: $rel"
+            continue
+        fi
+        PLAN_SRC+=("$disk")
+        PLAN_DST+=("$master")
+        PLAN_REL+=("$rel")
+        PLAN_UNIT+=("$unit")
+        PLAN_ROOT+=("$root")
+        PAIR_COUNT["$disk"$'\x1f'"$master"]=$(( ${PAIR_COUNT["$disk"$'\x1f'"$master"]:-0} + 1 ))
+        UNIT_FILES["$root/$unit"]=$(( ${UNIT_FILES["$root/$unit"]:-0} + 1 ))
+        UNIT_MOVING["$root/$unit"]=$(( ${UNIT_MOVING["$root/$unit"]:-0} + 1 ))
+    done < <(find "$disk/$root" -type f ! \( "${VIDEO_FIND[@]}" \) -printf '%P\0' 2>/dev/null)
+    return 0
+}
+
+# ----------------------------------------------------------
+# Plan: print it, then (live) carry it out
+# ----------------------------------------------------------
+
+# One GATHER line per unit, its files on a dry run, then one BATCH line per
+# disk pair. Sorted by unit then path; the 0x1f fields survive any filename.
+print_plan() {
+    local mode=$1 rec root unit rest rel idx key count last=""
+    local -a order=()
+    local -a pairs=()
+
+    if [ "${#PLAN_REL[@]}" -gt 0 ]; then
+        while IFS= read -r -d '' rec; do
+            order+=("$rec")
+        done < <(
+            for idx in "${!PLAN_REL[@]}"; do
+                printf '%s\x1f%s\x1f%s\x1f%s\0' \
+                    "${PLAN_ROOT[idx]}" "${PLAN_UNIT[idx]}" "${PLAN_REL[idx]}" "$idx"
+            done | sort -z -t $'\x1f' -k1,3
+        )
+    fi
 
     echo
-    echo "------------------------------------------"
-    echo "Checking: $relative_path/$folder_name"
-    echo "------------------------------------------"
-
-    # Find which drives contain a video file
-    for disk in "${DISKS[@]}"; do
-
-        local folder="$disk/$relative_path/$folder_name"
-
-        [ -d "$folder" ] || continue
-
-        present="${present:+$present, }${disk##*/}"
-
-        if find "$folder" -type f \( "${VIDEO_FIND[@]}" \) -print -quit | grep -q .; then
-            video_disks+=("$disk")
-            ((video_drives++))
+    for rec in "${order[@]}"; do
+        root=${rec%%$'\x1f'*}
+        rest=${rec#*$'\x1f'}
+        unit=${rest%%$'\x1f'*}
+        rest=${rest#*$'\x1f'}
+        rel=${rest%$'\x1f'*}
+        idx=${rest##*$'\x1f'}
+        if [ "$root/$unit" != "$last" ]; then
+            count=${UNIT_MOVING["$root/$unit"]:-0}
+            echo "GATHER: $unit -> ${PLAN_DST[idx]}  ($count file(s))"
+            last="$root/$unit"
         fi
-
+        if [ "$mode" = "dry" ]; then
+            echo "MOVE: $rel"
+        fi
     done
 
-    # No video file found
-    if [ "$video_drives" -eq 0 ]; then
-        echo "SKIP: No video files found (looked for: ${VIDEO_EXTS[*]})"
-        REPORT_NO_VIDEO+=("  $relative_path/$folder_name - on ${present:-no configured disk}")
-        return
-    fi
-
-    if [ "$video_drives" -eq 1 ]; then
-        master="${video_disks[0]}"
-    else
-        # Several drives hold video. That is only ambiguous when one season
-        # appears on two of them: different seasons merge cleanly, a season on
-        # two drives would leave a copy behind ("Season 01" on disk2 and disk5).
-        local -A season_disks=()
-        local -A season_owner=()
-        local -A conflicted=()
-        local -A disk_videos=()
-
-        # Record, per drive, which top-level folder below the show holds video.
-        # A file directly in the show folder counts as "(top level)".
-        for disk in "${video_disks[@]}"; do
-
-            local folder="$disk/$relative_path/$folder_name"
-            local count=0
-
-            while IFS= read -r -d '' file; do
-                count=$((count + 1))
-                local rel=${file#"$folder/"}
-                local place="(top level)"
-                if [ "$rel" != "${rel#*/}" ]; then
-                    place=${rel%%/*}
-                fi
-                season_disks["$place"$'\t'"$disk"]=1
-            done < <(find "$folder" -type f \( "${VIDEO_FIND[@]}" \) -print0)
-
-            disk_videos["$disk"]=$count
-
-        done
-
-        for key in "${!season_disks[@]}"; do
-            season=${key%%$'\t'*}
-            owner=${key#*$'\t'}
-            if [ -n "${season_owner[$season]:-}" ] && [ "${season_owner[$season]}" != "$owner" ]; then
-                conflicted["$season"]=1
-            else
-                season_owner["$season"]="$owner"
-            fi
-        done
-
-        # A genuinely split season: picking a winner would be a guess
-        if [ "${#conflicted[@]}" -ne 0 ]; then
-            local detail="" part disks
-            local -a parts=("${!conflicted[@]}")
-            mapfile -t parts < <(printf '%s\n' "${parts[@]}" | sort)
-
-            for part in "${parts[@]}"; do
-                disks=""
-                for disk in "${video_disks[@]}"; do
-                    if [ -n "${season_disks["$part"$'\t'"$disk"]:-}" ]; then
-                        disks="${disks:+$disks, }${disk##*/}"
-                    fi
-                done
-                detail="${detail:+$detail; }$part on $disks"
-            done
-
-            echo "SKIP: Video files found on multiple drives"
-            echo "       Conflicting: $(printf '%s\n' "${parts[@]}" | paste -sd ',' - | sed 's/,/, /g')"
-            echo "       Manual inspection required"
-            REPORT_CONFLICTS+=("  $relative_path/$folder_name - $detail")
-            return
-        fi
-
-        # Disjoint seasons: put the show on the drive that already holds most
-        # of it, then merge the rest as usual.
-        master="${video_disks[0]}"
-        local best=${disk_videos["${video_disks[0]}"]}
-        for disk in "${video_disks[@]:1}"; do
-            if [ "${disk_videos[$disk]}" -gt "$best" ]; then
-                master="$disk"
-                best=${disk_videos[$disk]}
-            fi
-        done
-
-        echo "MULTI-DRIVE: no season is split across drives"
-        echo "             $video_drives drives hold different seasons; $best video"
-        echo "             file(s) on the chosen drive"
-    fi
-
-    echo "MASTER DRIVE: $master"
-
-    # Consolidate files from all other drives
-    for disk in "${DISKS[@]}"; do
-
-        [ "$disk" = "$master" ] && continue
-
-        local source="$disk/$relative_path/$folder_name"
-        local destination="$master/$relative_path/$folder_name"
-
-        [ -d "$source" ] || continue
-
+    if [ "${#PAIR_COUNT[@]}" -gt 0 ]; then
         echo
-        echo "Source:      $source"
-        echo "Destination: $destination"
+        while IFS= read -r -d '' key; do
+            pairs+=("$key")
+        done < <(printf '%s\0' "${!PAIR_COUNT[@]}" | sort -z)
+        for key in "${pairs[@]}"; do
+            echo "BATCH: ${key%%$'\x1f'*} -> ${key##*$'\x1f'}  (${PAIR_COUNT[$key]} file(s))"
+        done
+    fi
+    return 0
+}
 
-        if [ "$DRY_RUN" -eq 1 ]; then
-            rsync -avhn --ignore-existing "$source/" "$destination/"
-        else
-            mkdir -p "$destination"
+# Move one unit's planned files. A non-zero rsync means part of them did not
+# arrive: say so, leave the source intact, and let the run exit non-zero.
+transfer_group() {
+    local src=$1 dst=$2 unit=$3 root=$4 list=$5
+    local source="$src/$root" destination="$dst/$root"
 
-            # A non-zero rsync means part of the folder did not arrive. Report it,
-            # skip the prune so the untouched source stays intact, and keep going:
-            # one bad folder must not stop the rest of the scan.
-            if ! rsync -avh --ignore-existing \
-                    --remove-source-files \
-                    "$source/" "$destination/"; then
-                folder_failed=$((folder_failed + 1))
-                echo "FAILED:  $source"
-                echo "         Transfer did not complete - source left in place"
-                continue
-            fi
+    mkdir -p "$destination"
 
-            # Remove empty directories left behind
-            find "$source" -depth -type d -empty -delete
-        fi
-
-    done
-
-    if [ "$folder_failed" -ne 0 ]; then
-        echo "FAILED:  $folder_name ($folder_failed source folder(s) not fully moved)"
+    if ! rsync -avh --from0 --files-from="$list" \
+            --ignore-existing --remove-source-files \
+            "$source/" "$destination/"; then
+        echo "FAILED:  $source"
+        echo "         Transfer did not complete - source left in place"
         return 1
     fi
 
-    echo "Finished: $folder_name"
+    if [ -d "$source/$unit" ]; then
+        find "$source/$unit" -depth -type d -empty -delete
+    fi
+    return 0
+}
 
+# Execute the plan: one rsync per (source disk, target disk, unit) group, fed a
+# NUL-delimited file list so any name survives. Grouped by sorting the plan.
+run_plan() {
+    local rec prefix idx rest src dst unit root tmp n
+    local -a records=()
+
+    [ "${#PLAN_REL[@]}" -gt 0 ] || return 0
+
+    if ! tmp=$(mktemp); then
+        echo "ABORT: cannot create a temporary file for the batch list"
+        exit 2
+    fi
+
+    while IFS= read -r -d '' rec; do
+        records+=("$rec")
+    done < <(
+        for idx in "${!PLAN_REL[@]}"; do
+            printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\0' \
+                "${PLAN_SRC[idx]}" "${PLAN_DST[idx]}" "${PLAN_UNIT[idx]}" \
+                "${PLAN_ROOT[idx]}" "$idx"
+        done | sort -z -t $'\x1f' -k1,4
+    )
+
+    prefix=""
+    n=0
+    for rec in "${records[@]}"; do
+        idx=${rec##*$'\x1f'}
+        if [ "${rec%$'\x1f'*}" != "$prefix" ]; then
+            if [ -n "$prefix" ]; then
+                if transfer_group "$src" "$dst" "$unit" "$root" "$tmp"; then
+                    MOVED=$((MOVED + n))
+                else
+                    failures=$((failures + 1))
+                fi
+            fi
+            prefix=${rec%$'\x1f'*}
+            src=${prefix%%$'\x1f'*}
+            rest=${prefix#*$'\x1f'}
+            dst=${rest%%$'\x1f'*}
+            rest=${rest#*$'\x1f'}
+            unit=${rest%%$'\x1f'*}
+            root=${rest#*$'\x1f'}
+            : > "$tmp"
+            n=0
+        fi
+        printf '%s\0' "${PLAN_REL[idx]}" >> "$tmp"
+        n=$((n + 1))
+    done
+
+    if [ -n "$prefix" ]; then
+        if transfer_group "$src" "$dst" "$unit" "$root" "$tmp"; then
+            MOVED=$((MOVED + n))
+        else
+            failures=$((failures + 1))
+        fi
+    fi
+
+    rm -f "$tmp"
+    return 0
+}
+
+# The four numbers the owner reads at the end of a run.
+print_report() {
+    local mode=$1 moved
+    if [ "$mode" = "dry" ]; then
+        moved="${#PLAN_REL[@]} file(s) to move"
+    else
+        moved="$MOVED file(s) moved"
+    fi
+    echo
+    echo "REPORT: $moved"
+    echo "REPORT: $(( ${#CONFLICT[@]} + ${#REPORT_NO_VIDEO[@]} )) unit(s) skipped for manual inspection  ($(( ${#CONFLICT[@]} )) conflict, ${#REPORT_NO_VIDEO[@]} no video)"
+    echo "REPORT: $LEFT_IN_PLACE file(s) left in place"
+    echo "REPORT: $DUPLICATES file(s) already on the master, left on their own disk"
 }
 
 # ----------------------------------------------------------
 # Scan each configured media directory
 # ----------------------------------------------------------
 
-# Counts movie/show folders whose transfer did not complete, so the run can exit
-# non-zero instead of reporting success over a partial move.
+# Counts groups whose transfer did not complete, so the run can exit non-zero
+# instead of reporting success over a partial move.
 failures=0
 
 for relative_path in "${FOLDERS[@]}"; do
@@ -277,8 +457,8 @@ for relative_path in "${FOLDERS[@]}"; do
     echo "Scanning: $relative_path"
     echo "=========================================="
 
-    # Collect folder names across all configured drives
-    declare -A folders=()
+    # Collect top-level folder names across all configured drives
+    TOPS=()
 
     for disk in "${DISKS[@]}"; do
 
@@ -287,7 +467,8 @@ for relative_path in "${FOLDERS[@]}"; do
         [ -d "$root" ] || continue
 
         while IFS= read -r -d '' name; do
-            folders["$name"]=1
+            TOPS["$name"]=1
+            TOP_PRESENT["$relative_path/$name"$'\x1f'"$disk"]=1
         done < <(
             find "$root" -mindepth 1 -maxdepth 1 \
                 -type d -printf '%f\0'
@@ -295,12 +476,29 @@ for relative_path in "${FOLDERS[@]}"; do
 
     done
 
-    # Process each movie/show folder
-    for folder_name in "${!folders[@]}"; do
-        process_folder "$relative_path" "$folder_name" || failures=$((failures + 1))
+    [ "${#TOPS[@]}" -gt 0 ] || continue
+
+    for disk in "${DISKS[@]}"; do
+        [ -d "$disk/$relative_path" ] || continue
+        index_videos "$disk" "$relative_path"
     done
 
-    unset folders
+    resolve_masters "$relative_path"
+
+    for disk in "${DISKS[@]}"; do
+        [ -d "$disk/$relative_path" ] || continue
+        index_files "$disk" "$relative_path"
+    done
+
+    # Clear, never unset: unset drops the associative attribute, and the next
+    # root would then read the path keys as arithmetic.
+    TOPS=()
+    TOP_PRESENT=()
+    TOP_VIDEO=()
+    SUB_VIDEO=()
+    GROUP_VIDEO=()
+    TOP_MASTER=()
+    UNIT_MASTER=()
 
 done
 
@@ -309,6 +507,15 @@ echo "=========================================="
 echo " Consolidation scan complete"
 echo "=========================================="
 echo "Log:         $LOG_FILE"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    print_plan dry
+    print_report dry
+else
+    print_plan live
+    run_plan
+    print_report live
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
 

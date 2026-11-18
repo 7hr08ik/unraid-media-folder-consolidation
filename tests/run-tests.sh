@@ -16,8 +16,9 @@
 # disk error: the contract under test is how the script reacts to a non-zero
 # rsync status, not rsync's own behaviour on a sick filesystem.
 #
-# These cases assert the documented contract (each movie/show ends up on one
-# drive, ambiguity is skipped, dry run moves nothing, a failed transfer is not
+# These cases assert the documented contract (each movie or season's non-video
+# files end up on the drive holding its video; a video file never moves;
+# ambiguity is skipped; a dry run moves nothing; a failed transfer is not
 # reported as success) — not the implementation's internals.
 # =============================================================================
 set -u
@@ -110,7 +111,7 @@ prepare() {
         printf 'harness error: LOG_DIR rewrite did not apply\n' >&2
         exit 99
     fi
-    if [ "$value" != "default" ] && grep -q "^DRY_RUN=1\$" "$dir/under-test.sh"; then
+    if [ "$value" != "default" ] && ! grep -q "^DRY_RUN=$value\$" "$dir/under-test.sh"; then
         printf 'harness error: DRY_RUN rewrite did not apply\n' >&2
         exit 99
     fi
@@ -175,13 +176,58 @@ case_consolidates_onto_media_disk() {
     local rc=$?
 
     assert "exit 0"                  [ "$rc" -eq 0 ]
-    assert "picks the mkv disk"      has "MASTER DRIVE: $CASE/disk1"
+    assert "picks the mkv disk"      has "GATHER: Alpha -> $CASE/disk1"
     assert "nfo moved"               exists "$CASE/disk1/Data/Movies/Alpha/Alpha.nfo"
     assert "subtitle moved"          exists "$CASE/disk1/Data/Movies/Alpha/Alpha.srt"
     assert "trickplay moved"         exists "$CASE/disk1/Data/Movies/Alpha/trickplay/0001/thumb.jpg"
     assert "mkv stays put"           exists "$CASE/disk1/Data/Movies/Alpha/Alpha.mkv"
     assert "emptied source removed"  missing "$CASE/disk2/Data/Movies/Alpha"
-    assert "reports the folder done" has "Finished: Alpha"
+    end
+}
+
+# The simplest gather: a movie folder whose metadata sits on another disk.
+case_gathers_metadata_onto_video_disk() {
+    begin gathers-metadata-onto-video-disk
+    make_disks 2
+    build_alpha
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exit 0"                    [ "$rc" -eq 0 ]
+    assert "names the unit and disk"   has "GATHER: Alpha -> $CASE/disk1"
+    assert "lists the nfo move"        has "MOVE: Alpha/Alpha.nfo"
+    assert "lists the trickplay move"  has "MOVE: Alpha/trickplay/0001/thumb.jpg"
+    assert "never lists a video"       lacks "MOVE: Alpha/Alpha.mkv"
+    assert "moved nothing"             exists "$CASE/disk2/Data/Movies/Alpha/Alpha.nfo"
+    end
+}
+
+# Files already on the master are not in the plan.
+case_already_consolidated_is_not_planned() {
+    begin already-consolidated-is-not-planned
+    make_disks 2
+    mkdir -p "$CASE/disk1/Data/Movies/Alpha"
+    : > "$CASE/disk1/Data/Movies/Alpha/Alpha.mkv"
+    : > "$CASE/disk1/Data/Movies/Alpha/poster.jpg"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    assert "nothing to gather"   lacks "GATHER: Alpha"
+    assert "nothing to move"     lacks "MOVE: Alpha/poster.jpg"
+    end
+}
+
+# A newline in a filename survives the index, the plan and the report.
+case_newline_in_filename_is_planned() {
+    begin newline-in-filename-is-planned
+    make_disks 2
+    local odd=$'poster\nnewline.jpg'
+    mkdir -p "$CASE/disk1/Data/Movies/Alpha" "$CASE/disk2/Data/Movies/Alpha"
+    : > "$CASE/disk1/Data/Movies/Alpha/Alpha.mkv"
+    : > "$CASE/disk2/Data/Movies/Alpha/$odd"
+    prepare "$CASE" 1
+    run_and_log "$CASE"
+    assert "plan holds the newline name" bash -c \
+        'grep -qF "MOVE: Alpha/poster" "$1" && grep -qF "newline.jpg" "$1"' _ "$CASE/out.log"
     end
 }
 
@@ -238,7 +284,7 @@ case_detects_uppercase_extension() {
     local rc=$?
 
     assert "exit 0"               [ "$rc" -eq 0 ]
-    assert "picks the .MKV disk"  has "MASTER DRIVE: $CASE/disk2"
+    assert "picks the .MKV disk"  has "GATHER: Echo -> $CASE/disk2"
     assert "metadata moved"       exists "$CASE/disk2/Data/Movies/Echo/Echo.nfo"
     end
 }
@@ -256,7 +302,7 @@ case_detects_other_video_formats() {
     local rc=$?
 
     assert "exit 0"              [ "$rc" -eq 0 ]
-    assert "picks the .mp4 disk" has "MASTER DRIVE: $CASE/disk2"
+    assert "picks the .mp4 disk" has "GATHER: Mu -> $CASE/disk2"
     assert "metadata moved"      exists "$CASE/disk2/Data/Movies/Mu/Mu.nfo"
     assert "source removed"      missing "$CASE/disk1/Data/Movies/Mu"
     end
@@ -297,7 +343,7 @@ case_extension_list_drives_detection() {
     assert "exit 0"               [ "$rc" -eq 0 ]
     assert "skips the mkv folder" has "SKIP: No video files found"
     assert "names the new list"   has "looked for: mp4)"
-    assert "no master chosen"     lacks "MASTER DRIVE"
+    assert "no master chosen"     lacks "GATHER:"
     assert "metadata untouched"   exists "$CASE/disk2/Data/Movies/Alpha/Alpha.nfo"
     end
 }
@@ -337,7 +383,7 @@ case_handles_spaces_in_paths() {
     local rc=$?
 
     assert "exit 0"        [ "$rc" -eq 0 ]
-    assert "picks disk1"   has "MASTER DRIVE: $CASE/disk1"
+    assert "picks disk1"   has "GATHER: Show One -> $CASE/disk1"
     assert "subtitle moved" exists "$CASE/disk1/Data/TV_Shows/Live Action/Show One/S01E01.en.srt"
     assert "source removed" missing "$CASE/disk3/Data/TV_Shows/Live Action/Show One"
     end
@@ -421,7 +467,7 @@ case_absent_disk_is_not_fatal() {
 
     assert "exit 0"                      [ "$rc" -eq 0 ]
     assert "no missing-path error"       lacks "No such file or directory"
-    assert "scanned what exists"         has "Checking: Data/Movies/Omega"
+    assert "scanned what exists"         lacks "SKIP: No video files found"
     end
 }
 
@@ -449,35 +495,6 @@ case_prunes_only_the_moved_folder() {
     end
 }
 
-# A drive holding different seasons of the same show is not ambiguous: no
-# season is split, so merging the drives cannot overwrite an episode. 58 such
-# folders exist in the library this was developed against, and the old
-# "multiple drives" rule skipped them all. The drive with the most episodes
-# becomes the master.
-case_merges_disjoint_seasons() {
-    begin merges-disjoint-seasons
-    make_disks 3
-    mkdir -p "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01" \
-             "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02"
-    : > "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01/Delta - S01E01.mkv"
-    : > "$CASE/disk1/Data/TV_Shows/Live Action/Delta/poster.jpg"
-    : > "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/Delta - S02E01.mkv"
-    : > "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/Delta - S02E02.mkv"
-
-    prepare "$CASE" 0
-    run_and_log "$CASE"
-    local rc=$?
-
-    assert "exit 0"                             [ "$rc" -eq 0 ]
-    assert "reports a disjoint merge"           has "MULTI-DRIVE: no season is split"
-    assert "picks the drive with more episodes" has "MASTER DRIVE: $CASE/disk2"
-    assert "other season moved over"            exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 01/Delta - S01E01.mkv"
-    assert "master season stays"                exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/Delta - S02E02.mkv"
-    assert "artwork moved over"                 exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/poster.jpg"
-    assert "emptied drive cleared"              missing "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01"
-    end
-}
-
 # The same season on two drives is a genuine conflict — merging would leave one
 # copy behind — so skip, name the season, and ask for a human. 137 folders in
 # the library this was developed against look like this.
@@ -498,29 +515,6 @@ case_skips_season_split_across_drives() {
     assert "names the split season"      has "Conflicting: Season 01"
     assert "asks for manual inspection" has "Manual inspection required"
     assert "both copies untouched"      exists "$CASE/disk2/Data/TV_Shows/Live Action/Epsilon/Season 01/E02.mkv"
-    end
-}
-
-# The shipped default is a dry run, including for the new multi-drive merge: it
-# must describe the transfer and move nothing.
-case_dry_run_plans_disjoint_season_merge() {
-    begin dry-run-plans-disjoint-season-merge
-    make_disks 2
-    mkdir -p "$CASE/disk1/Data/TV_Shows/Live Action/Zeta/Season 01" \
-             "$CASE/disk2/Data/TV_Shows/Live Action/Zeta/Season 02"
-    : > "$CASE/disk1/Data/TV_Shows/Live Action/Zeta/Season 01/Zeta - S01E01.mkv"
-    : > "$CASE/disk2/Data/TV_Shows/Live Action/Zeta/Season 02/Zeta - S02E01.mkv"
-    : > "$CASE/disk2/Data/TV_Shows/Live Action/Zeta/Season 02/Zeta - S02E02.mkv"
-
-    prepare "$CASE" default
-    run_and_log "$CASE"
-    local rc=$?
-
-    assert "exit 0"                 [ "$rc" -eq 0 ]
-    assert "announces dry run"      has "MODE: DRY RUN"
-    assert "describes the transfer" has "Source:"
-    assert "source still there"     exists "$CASE/disk1/Data/TV_Shows/Live Action/Zeta/Season 01/Zeta - S01E01.mkv"
-    assert "nothing copied"         missing "$CASE/disk2/Data/TV_Shows/Live Action/Zeta/Season 01"
     end
 }
 
@@ -565,8 +559,7 @@ case_consolidates_other_vids() {
     local rc=$?
 
     assert "exit 0"                      [ "$rc" -eq 0 ]
-    assert "scans Other_Vids"            has "Checking: Data/TV_Shows/Other_Vids/My Videos"
-    assert "merges onto the video drive" has "MASTER DRIVE: $CASE/disk1"
+    assert "scans Other_Vids"            has "GATHER: My Videos -> $CASE/disk1"
     assert "note moved"                  exists "$CASE/disk1/Data/TV_Shows/Other_Vids/My Videos/clip-notes.txt"
     end
 }
@@ -641,7 +634,7 @@ case_duplicate_ignore_file_does_not_block_merge() {
     local rc=$?
 
     assert "exit 0"                        [ "$rc" -eq 0 ]
-    assert "still consolidates"            has "Finished: Toys"
+    assert "still consolidates"            has "GATHER: Toys -> $CASE/disk1"
     assert "metadata moved"                exists "$CASE/disk1/Data/Movies/Toys/Toys.nfo"
     assert "skipped duplicate left behind" exists "$CASE/disk2/Data/Movies/Toys/trickplay/.ignore"
     end
@@ -723,7 +716,7 @@ case_disjoint_merge_is_not_an_issue() {
 
     assert "exit 0"            [ "$rc" -eq 0 ]
     assert "no issues block"   lacks "ISSUES TO RESOLVE"
-    assert "still plans merge" has "Source:"
+    assert "no conflict"       lacks "Manual inspection required"
     end
 }
 
@@ -748,7 +741,7 @@ case_dry_run_writes_a_log_and_nothing_else() {
     assert "one log file"              [ "$(ls "$CASE"/log/*.log 2>/dev/null | wc -l)" -eq 1 ]
     assert "log names itself"          grep -qF "LOG:         $log" "$CASE/out.log"
     assert "log records the mode"      grep -qF "MODE: DRY RUN - No files will be moved" "$log"
-    assert "log records the run"       grep -qF "Checking: Data/Movies/Alpha" "$log"
+    assert "log records the run"       grep -qF "Scanning: Data/Movies" "$log"
     assert "log records the outcome"   grep -qF "Nothing was moved." "$log"
     assert "media tree untouched"      [ "$before" = "$after" ]
     assert "source left in place"      exists "$CASE/disk2/Data/Movies/Alpha/Alpha.nfo"
@@ -797,6 +790,9 @@ bash -n "$SCRIPT" || { printf 'gate failed: %s does not parse\n' "$SCRIPT" >&2; 
 
 case_default_is_dry_run
 case_consolidates_onto_media_disk
+case_gathers_metadata_onto_video_disk
+case_already_consolidated_is_not_planned
+case_newline_in_filename_is_planned
 case_skips_media_on_multiple_disks
 case_skips_folder_without_media
 case_detects_uppercase_extension
@@ -810,9 +806,7 @@ case_failed_rsync_is_not_success
 case_invalid_dry_run_refuses_to_run
 case_absent_disk_is_not_fatal
 case_prunes_only_the_moved_folder
-case_merges_disjoint_seasons
 case_skips_season_split_across_drives
-case_dry_run_plans_disjoint_season_merge
 case_detects_ogm_and_divx
 case_consolidates_other_vids
 case_handles_unicode_and_punctuation
