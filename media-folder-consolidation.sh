@@ -121,11 +121,20 @@ top_of() {
     printf '%s' "${1%%/*}"
 }
 
-# The unit a file belongs to, relative to the configured root. A file directly
-# under the root belongs to no unit: it is not part of a movie or a show.
+# The unit a file belongs to, relative to the configured root: the nearest
+# directory below the top-level folder that holds video anywhere in its
+# subtree, or the top-level folder itself when nothing below it does. A file
+# directly under the root belongs to no unit: it is not part of a movie or show.
 unit_of() {
-    local rel=$2
+    local root=$1 rel=$2 cand
     [ "$rel" = "${rel%%/*}" ] && return 1
+    # Inlined dir_of: this runs once per non-video file, and a command
+    # substitution per step costs ~2 ms each (measured 100 s per 50k files).
+    cand=${rel%/*}
+    while [ "$cand" != "${rel%%/*}" ]; do
+        [ -n "${UNIT_MASTER["$root/$cand"]:-}" ] && { printf '%s' "$cand"; return 0; }
+        cand=${cand%/*}
+    done
     printf '%s' "${rel%%/*}"
 }
 
@@ -187,10 +196,13 @@ index_videos() {
 # Pick the disk each top-level folder belongs on, or name the folder a human
 # must resolve. A child folder holding video on two disks is ambiguous: one
 # copy would have to win, so the whole show is skipped rather than guessed at.
+# Then pick the disk each video-bearing folder below the top belongs on.
 resolve_masters() {
-    local root=$1 top disk count best best_count key rest group
+    local root=$1 top disk count best best_count key rest group dir rel
     local -a conflicts=()
+    local -a units=()
     local -A group_count=()
+    local -A unit_seen=()
 
     for top in "${!TOPS[@]}"; do
         best=""
@@ -252,6 +264,35 @@ resolve_masters() {
 
         TOP_MASTER["$root/$top"]=$best
         UNIT_MASTER["$root/$top"]=$best
+    done
+
+    # Every directory below a top-level folder that holds video anywhere in its
+    # subtree is a unit of its own: a season's metadata follows its own episodes
+    # and sibling seasons never compete for the show's majority disk. Ties go to
+    # the earliest configured disk, as they do above.
+    for key in "${!SUB_VIDEO[@]}"; do
+        dir=${key%$'\x1f'*}
+        rel=${dir#"$root/"}
+        [ "$rel" != "$dir" ] || continue
+        [ "$rel" != "${rel%%/*}" ] || continue
+        [ -n "${unit_seen[$dir]:-}" ] && continue
+        unit_seen["$dir"]=1
+        units+=("$dir")
+    done
+
+    for dir in "${units[@]}"; do
+        best=""
+        best_count=0
+        for disk in "${DISKS[@]}"; do
+            count=${SUB_VIDEO["$dir"$'\x1f'"$disk"]:-0}
+            if [ "$count" -gt "$best_count" ]; then
+                best=$disk
+                best_count=$count
+            fi
+        done
+        if [ -n "$best" ]; then
+            UNIT_MASTER["$dir"]=$best
+        fi
     done
     return 0
 }

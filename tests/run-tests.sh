@@ -518,6 +518,65 @@ case_skips_season_split_across_drives() {
     end
 }
 
+# Seasons on different disks are siblings, not a split: each season is its own
+# unit and neither is a conflict. 1,000+ shows in the library look like this.
+case_seasons_stay_on_their_own_disks() {
+    begin seasons-stay-on-their-own-disks
+    make_disks 2
+    mkdir -p "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01" \
+             "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02"
+    : > "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01/S01E01.mkv"
+    : > "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.mkv"
+    : > "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.srt"
+    prepare "$CASE" 0
+    run_and_log "$CASE"
+    local rc=$?
+    assert "exit 0"                 [ "$rc" -eq 0 ]
+    assert "season 1 mkv stays"     exists "$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01/S01E01.mkv"
+    assert "season 2 mkv stays"     exists "$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02/S02E01.mkv"
+    assert "no season is a conflict" lacks "Manual inspection required"
+    end
+}
+
+# A season's metadata follows its own season, not the show's majority disk.
+case_season_metadata_follows_its_season() {
+    begin season-metadata-follows-its-season
+    make_disks 2
+    local base1="$CASE/disk1/Data/TV_Shows/Live Action/Delta"
+    local base2="$CASE/disk2/Data/TV_Shows/Live Action/Delta"
+    mkdir -p "$base1/Season 01" "$base1/Season 02" "$base2/Season 02"
+    : > "$base1/Season 01/S01E01.mkv"
+    : > "$base1/Season 01/S01E02.mkv"
+    : > "$base1/Season 01/S01E03.mkv"
+    : > "$base2/Season 02/S02E01.mkv"
+    : > "$base1/Season 02/season.nfo"
+    : > "$base1/Delta.nfo"
+    prepare "$CASE" 0
+    run_and_log "$CASE"
+    assert "season.nfo goes to season 2's disk" exists "$base2/Season 02/season.nfo"
+    assert "show nfo stays on the majority disk" exists "$base1/Delta.nfo"
+    end
+}
+
+# A disc folder is the unit when the season root holds no video.
+case_disc_folder_is_the_unit() {
+    begin disc-folder-is-the-unit
+    make_disks 2
+    local s1="$CASE/disk1/Data/TV_Shows/Live Action/Delta/Season 01"
+    local s2="$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 01"
+    local s3="$CASE/disk2/Data/TV_Shows/Live Action/Delta/Season 02"
+    mkdir -p "$s1/Disc 1" "$s2" "$s3"
+    : > "$s1/Disc 1/S01E01.mkv"
+    : > "$s2/season.nfo"
+    : > "$s3/S02E01.mkv"
+    : > "$s3/S02E02.mkv"
+    prepare "$CASE" 0
+    run_and_log "$CASE"
+    assert "season.nfo follows its own season" exists "$s1/season.nfo"
+    assert "season 2 video stays"              exists "$s3/S02E01.mkv"
+    end
+}
+
 # .ogm and .divx appear in the library this was developed against. Left out of
 # the list, those folders look empty and are skipped forever.
 case_detects_ogm_and_divx() {
@@ -807,6 +866,9 @@ case_invalid_dry_run_refuses_to_run
 case_absent_disk_is_not_fatal
 case_prunes_only_the_moved_folder
 case_skips_season_split_across_drives
+case_seasons_stay_on_their_own_disks
+case_season_metadata_follows_its_season
+case_disc_folder_is_the_unit
 case_detects_ogm_and_divx
 case_consolidates_other_vids
 case_handles_unicode_and_punctuation
