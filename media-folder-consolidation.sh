@@ -85,189 +85,569 @@ for ext in "${VIDEO_EXTS[@]:1}"; do
     VIDEO_FIND+=(-o -iname "*.$ext")
 done
 
+# Extension, lowercased -> 1, so is_video() is a lookup instead of a process per
+# file. Lowercasing here matches the extension is_video() reads from the path,
+# so an uppercase entry in VIDEO_EXTS still arms the guard.
+declare -A VIDEO_EXT_SET=()
+for ext in "${VIDEO_EXTS[@]}"; do
+    VIDEO_EXT_SET["${ext,,}"]=1
+done
+
 # Problems a dry run cannot resolve on its own. Collected during the scan and
 # reported together at the end, so one pass tells the owner everything to fix.
 REPORT_CONFLICTS=()
 REPORT_NO_VIDEO=()
 
 # ----------------------------------------------------------
-# Process a movie folder or TV show folder
+# Path helpers
 # ----------------------------------------------------------
 
-process_folder() {
+# A file is a video when its extension, compared case-insensitively, is one of
+# the configured formats. A name without an extension is not a video.
+is_video() {
+    local path=$1 ext
+    [ "$path" != "${path%.*}" ] || return 1
+    ext=${path##*.}
+    [ -n "${VIDEO_EXT_SET[${ext,,}]:-}" ]
+}
 
-    local relative_path="$1"
-    local folder_name="$2"
+# The depth clamp that unit_of and the conflict pass share: a unit is a movie
+# folder or a season folder, never deeper, so Season 01/Disc 1 belongs to
+# Season 01 and a disc split is its season's conflict. Sets CLAMPED to the
+# clamped path; fails for the top-level folder itself, which is no unit.
+clamp_unit() {
+    local rel=$1 top rest
+    top=${rel%%/*}
+    rest=${rel#*/}
+    [ "$rest" = "$rel" ] && return 1
+    if [ "$rest" = "${rest%%/*}" ]; then
+        CLAMPED=$rel
+    else
+        CLAMPED="$top/${rest%%/*}"
+    fi
+    return 0
+}
 
-    local master=""
-    local video_drives=0
-    local folder_failed=0
-    local disk file key season owner present=""
-    local -a video_disks=()
+# True when the directory holds video on any configured disk.
+has_video() {
+    local dir=$1 disk
+    for disk in "${DISKS[@]}"; do
+        [ -n "${SUB_VIDEO["$dir"$'\x1f'"$disk"]:-}" ] && return 0
+    done
+    return 1
+}
+
+# The unit a file belongs to, relative to the configured root: the nearest
+# directory at or below the clamp that holds video anywhere in its subtree, or
+# the top-level folder itself when nothing below it does. A file directly under
+# the root belongs to no unit: it is not part of a movie or show.
+unit_of() {
+    local root=$1 rel=$2 cand top
+    top=${rel%%/*}
+    [ "$rel" = "$top" ] && return 1
+    if clamp_unit "${rel%/*}"; then
+        cand=$CLAMPED
+    else
+        cand=$top
+    fi
+    while [ "$cand" != "$top" ]; do
+        has_video "$root/$cand" && { printf '%s' "$cand"; return 0; }
+        cand=${cand%/*}
+    done
+    printf '%s' "$top"
+}
+
+# ----------------------------------------------------------
+# Index: which disk holds the video, and which files follow it
+# ----------------------------------------------------------
+
+# Keys that name a disk join two parts with 0x1f, the separator every split in
+# this script reads.
+declare -A TOPS=()          # top-level folder name -> 1
+declare -A TOP_PRESENT=()   # "<root>/<top>" 0x1f <disk> -> 1
+declare -A TOP_VIDEO=()     # "<root>/<top>" 0x1f <disk> -> video files
+declare -A TOP_OWN_VIDEO=() # "<root>/<top>" 0x1f <disk> -> 1, video directly in it
+declare -A SUB_VIDEO=()     # "<root>/<dir>" 0x1f <disk> -> video files below it
+declare -A TOP_MASTER=()    # "<root>/<top>" -> disk holding most of it
+declare -A UNIT_MASTER=()   # "<root>/<unit>" -> disk the unit belongs on
+declare -A CONFLICT=()      # "<root>/<unit>" -> 1, a human must decide
+
+# The plan. PLAN_REL is relative to the configured root, which is what a MOVE:
+# line shows; PLAN_ROOT keeps the root needed to build the real source path.
+declare -a PLAN_SRC=()
+declare -a PLAN_DST=()
+declare -a PLAN_REL=()
+declare -a PLAN_UNIT=()
+declare -a PLAN_ROOT=()
+declare -A PAIR_COUNT=()   # "<src>" 0x1f <dst> -> planned files
+declare -A UNIT_FILES=()   # "<root>/<unit>" -> non-video files seen
+declare -A UNIT_MOVING=()  # "<root>/<unit>" -> non-video files planned
+declare -A LEFT_IN_PLACE=() # "<root>/<unit>" -> "<disk>" 0x1f "<unit>", reported
+
+DUPLICATES=0
+SKIPPED_FILES=0
+MOVED=0
+
+# Count the video files each directory holds, so the disk with the most video
+# for a movie or show becomes its master. One find pass per disk root.
+index_videos() {
+    local disk=$1 root=$2 rel dir top anc
+    while IFS= read -r -d '' rel; do
+        # Inlined dir_of: this runs once per file and once per ancestor level,
+        # and a command substitution per step costs ~2 ms each.
+        if [ "$rel" = "${rel##*/}" ]; then
+            dir=.
+        else
+            dir=${rel%/*}
+        fi
+        top=${rel%%/*}
+        if [ "$dir" = "$top" ]; then
+            TOP_OWN_VIDEO["$root/$top"$'\x1f'"$disk"]=1
+        fi
+        anc=$dir
+        while :; do
+            SUB_VIDEO["$root/$anc"$'\x1f'"$disk"]=$(( ${SUB_VIDEO["$root/$anc"$'\x1f'"$disk"]:-0} + 1 ))
+            [ "$anc" = "$top" ] && break
+            [ "$anc" = "." ] && break
+            anc=${anc%/*}
+        done
+        TOP_VIDEO["$root/$top"$'\x1f'"$disk"]=$(( ${TOP_VIDEO["$root/$top"$'\x1f'"$disk"]:-0} + 1 ))
+    done < <(find "$disk/$root" -type f \( "${VIDEO_FIND[@]}" \) -printf '%P\0' 2>/dev/null)
+    return 0
+}
+
+# Name a unit whose video sits on more than one disk. A unit is at most one
+# level below its top-level folder, so its own name is the last component.
+report_conflict() {
+    local root=$1 unit=$2 disks=$3 top=${2%%/*}
+    echo "SKIP: Video files found on multiple drives"
+    echo "       Conflicting: $unit on $disks"
+    echo "       Manual inspection required"
+    CONFLICT["$root/$unit"]=1
+    if [ "$unit" = "$top" ]; then
+        REPORT_CONFLICTS+=("  $root/$top - video files directly in it on $disks")
+    else
+        REPORT_CONFLICTS+=("  $root/$top - ${unit#*/} on $disks")
+    fi
+}
+
+# Pick the disk each unit belongs on, and name the units a human must resolve.
+# A unit whose own video sits on two or more disks cannot have its files follow
+# it, so only that unit is skipped and reported; its siblings are gathered as
+# usual. A unit is a movie folder or a season folder, never deeper: a season
+# split into disc folders is one unit on two disks, and that is a conflict.
+resolve_masters() {
+    local root=$1 top disk count best best_count key dir rel unit disks present n
+    local -a units=()
+    local -A unit_seen=()
+    local -A unit_disks=()
+
+    # One pass over the subtree counts, each directory clamped to its unit:
+    # Season 01/Disc 1 and Disc 2 both land on Season 01, while sibling seasons
+    # land on themselves.
+    for key in "${!SUB_VIDEO[@]}"; do
+        [ -n "${SUB_VIDEO[$key]}" ] || continue
+        dir=${key%$'\x1f'*}
+        disk=${key##*$'\x1f'}
+        rel=${dir#"$root/"}
+        clamp_unit "$rel" || continue
+        [ -n "${unit_seen[$CLAMPED]:-}" ] || units+=("$CLAMPED")
+        unit_seen["$CLAMPED"]=1
+        unit_disks["$CLAMPED"$'\x1f'"$disk"]=1
+    done
+
+    for top in "${!TOPS[@]}"; do
+        best=""
+        best_count=0
+        for disk in "${DISKS[@]}"; do
+            count=${TOP_VIDEO["$root/$top"$'\x1f'"$disk"]:-0}
+            if [ "$count" -gt "$best_count" ]; then
+                best=$disk
+                best_count=$count
+            fi
+        done
+
+        if [ -z "$best" ]; then
+            present=""
+            for disk in "${DISKS[@]}"; do
+                [ -n "${TOP_PRESENT["$root/$top"$'\x1f'"$disk"]:-}" ] || continue
+                present="${present:+$present, }${disk##*/}"
+            done
+            echo "SKIP: No video files found in $top (looked for: ${VIDEO_EXTS[*]})"
+            REPORT_NO_VIDEO+=("  $root/$top - on ${present:-no configured disk}")
+            continue
+        fi
+
+        # Episodes directly in the movie folder put that folder — the unit — on
+        # two disks. Seasons below it are separate units and do not count.
+        disks=""
+        n=0
+        for disk in "${DISKS[@]}"; do
+            [ -n "${TOP_OWN_VIDEO["$root/$top"$'\x1f'"$disk"]:-}" ] || continue
+            disks="${disks:+$disks, }${disk##*/}"
+            n=$(( n + 1 ))
+        done
+        if [ "$n" -gt 1 ]; then
+            report_conflict "$root" "$top" "$disks"
+            continue
+        fi
+
+        TOP_MASTER["$root/$top"]=$best
+        UNIT_MASTER["$root/$top"]=$best
+    done
+
+    # Every unit below a top-level folder: the disk holding most of its video,
+    # or a conflict when its video is on two disks. Ties go to the earliest
+    # configured disk, as they do above. A conflicted top-level folder does not
+    # stop this: its seasons are separate units and still gather, only the
+    # files that resolve to the top itself are held back.
+    # printf with no arguments still writes one empty record, so an empty list
+    # is handled here instead of sorting a phantom unit.
+    [ "${#units[@]}" -gt 0 ] || return 0
+    while IFS= read -r -d '' unit; do
+        top=${unit%%/*}
+        best=""
+        best_count=0
+        disks=""
+        n=0
+        for disk in "${DISKS[@]}"; do
+            count=${SUB_VIDEO["$root/$unit"$'\x1f'"$disk"]:-0}
+            if [ "$count" -gt "$best_count" ]; then
+                best=$disk
+                best_count=$count
+            fi
+            [ -n "${unit_disks["$unit"$'\x1f'"$disk"]:-}" ] || continue
+            disks="${disks:+$disks, }${disk##*/}"
+            n=$(( n + 1 ))
+        done
+        if [ "$n" -gt 1 ]; then
+            report_conflict "$root" "$unit" "$disks"
+            continue
+        fi
+        if [ -n "$best" ]; then
+            UNIT_MASTER["$root/$unit"]=$best
+            # Video on a disk other than the show's own majority: the unit's
+            # files stay where they are. Informational, never an issue.
+            if [ -n "${TOP_MASTER["$root/$top"]:-}" ] && [ "$best" != "${TOP_MASTER["$root/$top"]}" ]; then
+                LEFT_IN_PLACE["$root/$unit"]="$best"$'\x1f'"$unit"
+            fi
+        fi
+    done < <(printf '%s\0' "${units[@]}" | sort -z)
+    return 0
+}
+
+# Add every non-video file that belongs on another disk to the plan. A video is
+# never planned: it is the anchor the other files gather around. A file whose
+# own unit is fine follows that unit even when its top-level folder is
+# conflicted; only the files that resolve to the conflicted folder itself stay.
+index_files() {
+    local disk=$1 root=$2 rel top unit master dir
+    # Every file in a directory resolves to the same unit, so the lookup runs
+    # once per directory: a command substitution per file cost ~0.3 ms, about
+    # 17 s of the run on the real library's 28k metadata files.
+    local -A unit_cache=()
+    while IFS= read -r -d '' rel; do
+        top=${rel%%/*}
+        dir=${rel%/*}
+        [ "$dir" = "$rel" ] && dir="."
+        if [ -n "${unit_cache[$dir]+set}" ]; then
+            unit=${unit_cache[$dir]}
+        else
+            unit=$(unit_of "$root" "$rel") || unit=""
+            unit_cache["$dir"]=$unit
+        fi
+        if [ -z "$unit" ]; then
+            # Directly under the configured root: not part of a movie or show.
+            SKIPPED_FILES=$((SKIPPED_FILES + 1))
+            continue
+        fi
+        if [ -n "${CONFLICT["$root/$unit"]:-}" ]; then
+            SKIPPED_FILES=$((SKIPPED_FILES + 1))
+            continue
+        fi
+        master=${UNIT_MASTER["$root/$unit"]:-${TOP_MASTER["$root/$top"]:-}}
+        if [ -z "$master" ]; then
+            SKIPPED_FILES=$((SKIPPED_FILES + 1))
+            continue
+        fi
+        # Counted before the master check, so a unit whose files already sit on
+        # its own disk still reports how many stayed there.
+        UNIT_FILES["$root/$unit"]=$(( ${UNIT_FILES["$root/$unit"]:-0} + 1 ))
+        [ "$master" = "$disk" ] && continue
+        if [ -e "$master/$root/$rel" ]; then
+            DUPLICATES=$((DUPLICATES + 1))
+            continue
+        fi
+        if is_video "$rel"; then
+            echo "SKIP: video file reached the plan: $rel"
+            continue
+        fi
+        PLAN_SRC+=("$disk")
+        PLAN_DST+=("$master")
+        PLAN_REL+=("$rel")
+        PLAN_UNIT+=("$unit")
+        PLAN_ROOT+=("$root")
+        PAIR_COUNT["$disk"$'\x1f'"$master"]=$(( ${PAIR_COUNT["$disk"$'\x1f'"$master"]:-0} + 1 ))
+        UNIT_MOVING["$root/$unit"]=$(( ${UNIT_MOVING["$root/$unit"]:-0} + 1 ))
+    done < <(find "$disk/$root" -type f ! \( "${VIDEO_FIND[@]}" \) -printf '%P\0' 2>/dev/null)
+    return 0
+}
+
+# ----------------------------------------------------------
+# Plan: print it, then (live) carry it out
+# ----------------------------------------------------------
+
+# One GATHER line per unit, its files on a dry run, then one BATCH line per
+# disk pair. Sorted by unit then path; the 0x1f fields survive any filename.
+print_plan() {
+    local mode=$1 rec root unit rest rel idx key count last=""
+    local -a order=()
+    local -a pairs=()
+
+    if [ "${#PLAN_REL[@]}" -gt 0 ]; then
+        while IFS= read -r -d '' rec; do
+            order+=("$rec")
+        done < <(
+            for idx in "${!PLAN_REL[@]}"; do
+                printf '%s\x1f%s\x1f%s\x1f%s\0' \
+                    "${PLAN_ROOT[idx]}" "${PLAN_UNIT[idx]}" "${PLAN_REL[idx]}" "$idx"
+            done | sort -z -t $'\x1f' -k1,3
+        )
+    fi
 
     echo
-    echo "------------------------------------------"
-    echo "Checking: $relative_path/$folder_name"
-    echo "------------------------------------------"
-
-    # Find which drives contain a video file
-    for disk in "${DISKS[@]}"; do
-
-        local folder="$disk/$relative_path/$folder_name"
-
-        [ -d "$folder" ] || continue
-
-        present="${present:+$present, }${disk##*/}"
-
-        if find "$folder" -type f \( "${VIDEO_FIND[@]}" \) -print -quit | grep -q .; then
-            video_disks+=("$disk")
-            ((video_drives++))
+    for rec in "${order[@]}"; do
+        root=${rec%%$'\x1f'*}
+        rest=${rec#*$'\x1f'}
+        unit=${rest%%$'\x1f'*}
+        rest=${rest#*$'\x1f'}
+        rel=${rest%$'\x1f'*}
+        idx=${rest##*$'\x1f'}
+        if [ "$root/$unit" != "$last" ]; then
+            count=${UNIT_MOVING["$root/$unit"]:-0}
+            echo "GATHER: $unit -> ${PLAN_DST[idx]}  ($count file(s))"
+            last="$root/$unit"
         fi
-
+        # Live mode leaves the per-file detail to rsync -avh, which already
+        # prints one line per transfer; a MOVE: line here would duplicate it.
+        if [ "$mode" = "dry" ]; then
+            echo "MOVE: $rel"
+        fi
     done
 
-    # No video file found
-    if [ "$video_drives" -eq 0 ]; then
-        echo "SKIP: No video files found (looked for: ${VIDEO_EXTS[*]})"
-        REPORT_NO_VIDEO+=("  $relative_path/$folder_name - on ${present:-no configured disk}")
-        return
-    fi
-
-    if [ "$video_drives" -eq 1 ]; then
-        master="${video_disks[0]}"
-    else
-        # Several drives hold video. That is only ambiguous when one season
-        # appears on two of them: different seasons merge cleanly, a season on
-        # two drives would leave a copy behind ("Season 01" on disk2 and disk5).
-        local -A season_disks=()
-        local -A season_owner=()
-        local -A conflicted=()
-        local -A disk_videos=()
-
-        # Record, per drive, which top-level folder below the show holds video.
-        # A file directly in the show folder counts as "(top level)".
-        for disk in "${video_disks[@]}"; do
-
-            local folder="$disk/$relative_path/$folder_name"
-            local count=0
-
-            while IFS= read -r -d '' file; do
-                count=$((count + 1))
-                local rel=${file#"$folder/"}
-                local place="(top level)"
-                if [ "$rel" != "${rel#*/}" ]; then
-                    place=${rel%%/*}
-                fi
-                season_disks["$place"$'\t'"$disk"]=1
-            done < <(find "$folder" -type f \( "${VIDEO_FIND[@]}" \) -print0)
-
-            disk_videos["$disk"]=$count
-
-        done
-
-        for key in "${!season_disks[@]}"; do
-            season=${key%%$'\t'*}
-            owner=${key#*$'\t'}
-            if [ -n "${season_owner[$season]:-}" ] && [ "${season_owner[$season]}" != "$owner" ]; then
-                conflicted["$season"]=1
-            else
-                season_owner["$season"]="$owner"
-            fi
-        done
-
-        # A genuinely split season: picking a winner would be a guess
-        if [ "${#conflicted[@]}" -ne 0 ]; then
-            local detail="" part disks
-            local -a parts=("${!conflicted[@]}")
-            mapfile -t parts < <(printf '%s\n' "${parts[@]}" | sort)
-
-            for part in "${parts[@]}"; do
-                disks=""
-                for disk in "${video_disks[@]}"; do
-                    if [ -n "${season_disks["$part"$'\t'"$disk"]:-}" ]; then
-                        disks="${disks:+$disks, }${disk##*/}"
-                    fi
-                done
-                detail="${detail:+$detail; }$part on $disks"
-            done
-
-            echo "SKIP: Video files found on multiple drives"
-            echo "       Conflicting: $(printf '%s\n' "${parts[@]}" | paste -sd ',' - | sed 's/,/, /g')"
-            echo "       Manual inspection required"
-            REPORT_CONFLICTS+=("  $relative_path/$folder_name - $detail")
-            return
-        fi
-
-        # Disjoint seasons: put the show on the drive that already holds most
-        # of it, then merge the rest as usual.
-        master="${video_disks[0]}"
-        local best=${disk_videos["${video_disks[0]}"]}
-        for disk in "${video_disks[@]:1}"; do
-            if [ "${disk_videos[$disk]}" -gt "$best" ]; then
-                master="$disk"
-                best=${disk_videos[$disk]}
-            fi
-        done
-
-        echo "MULTI-DRIVE: no season is split across drives"
-        echo "             $video_drives drives hold different seasons; $best video"
-        echo "             file(s) on the chosen drive"
-    fi
-
-    echo "MASTER DRIVE: $master"
-
-    # Consolidate files from all other drives
-    for disk in "${DISKS[@]}"; do
-
-        [ "$disk" = "$master" ] && continue
-
-        local source="$disk/$relative_path/$folder_name"
-        local destination="$master/$relative_path/$folder_name"
-
-        [ -d "$source" ] || continue
-
+    if [ "${#PAIR_COUNT[@]}" -gt 0 ]; then
         echo
-        echo "Source:      $source"
-        echo "Destination: $destination"
+        while IFS= read -r -d '' key; do
+            pairs+=("$key")
+        done < <(printf '%s\0' "${!PAIR_COUNT[@]}" | sort -z)
+        for key in "${pairs[@]}"; do
+            echo "BATCH: ${key%%$'\x1f'*} -> ${key##*$'\x1f'}  (${PAIR_COUNT[$key]} file(s))"
+        done
+    fi
+    return 0
+}
 
-        if [ "$DRY_RUN" -eq 1 ]; then
-            rsync -avhn --ignore-existing "$source/" "$destination/"
-        else
-            mkdir -p "$destination"
+# Scratch list for the batch in flight. The trap is installed on first use and
+# SCRATCH is global, because a function's locals are gone by the time EXIT runs.
+SCRATCH=""
+FAILED_FILES=0
 
-            # A non-zero rsync means part of the folder did not arrive. Report it,
-            # skip the prune so the untouched source stays intact, and keep going:
-            # one bad folder must not stop the rest of the scan.
-            if ! rsync -avh --ignore-existing \
-                    --remove-source-files \
-                    "$source/" "$destination/"; then
-                folder_failed=$((folder_failed + 1))
-                echo "FAILED:  $source"
-                echo "         Transfer did not complete - source left in place"
-                continue
-            fi
-
-            # Remove empty directories left behind
-            find "$source" -depth -type d -empty -delete
+# Delete directories left empty by a move, deepest first, in chunks so a large
+# batch cannot exceed the argument limit. -depth plus -empty means a directory
+# that still holds a duplicate or an unmoved file survives, and no configured
+# root is ever passed (every path ends below one).
+prune_dirs() {
+    local -a chunk=()
+    local d
+    for d in "$@"; do
+        chunk+=("$d")
+        if [ "${#chunk[@]}" -ge 500 ]; then
+            find "${chunk[@]}" -depth -type d -empty -delete 2>/dev/null
+            chunk=()
         fi
-
     done
+    [ "${#chunk[@]}" -gt 0 ] && find "${chunk[@]}" -depth -type d -empty -delete 2>/dev/null
+    return 0
+}
 
-    if [ "$folder_failed" -ne 0 ]; then
-        echo "FAILED:  $folder_name ($folder_failed source folder(s) not fully moved)"
+# Scratch counters for classify_batch; each call resets them and the caller
+# folds the results into the globals straight away.
+CLASS_MOVED=0
+CLASS_DUPLICATES=0
+CLASS_FAILED=0
+
+# Decide what happened to every planned entry by inspecting both sides:
+#   destination present, source gone     -> moved
+#   destination present, source present  -> --ignore-existing left it behind
+#   destination absent                   -> it never arrived: name it, count it
+# A vanished source root lands in the last case for every entry, so a batch
+# that moved nothing can no longer be reported as a success.
+classify_batch() {
+    local source=$1 destination=$2 rel
+    CLASS_MOVED=0
+    CLASS_DUPLICATES=0
+    CLASS_FAILED=0
+    while IFS= read -r -d '' rel; do
+        if [ ! -e "$destination/$rel" ]; then
+            CLASS_FAILED=$((CLASS_FAILED + 1))
+            echo "FAILED:  $source/$rel"
+        elif [ -e "$source/$rel" ]; then
+            CLASS_DUPLICATES=$((CLASS_DUPLICATES + 1))
+        else
+            CLASS_MOVED=$((CLASS_MOVED + 1))
+        fi
+    done < "$SCRATCH/list"
+    return 0
+}
+
+# Move one pair's files in a single rsync. --remove-source-files deletes only
+# what arrived; --ignore-existing is the guard against a stale copy overwriting
+# the master's metadata. A non-zero status means some files did not arrive, so
+# the source stays and the run exits non-zero.
+run_batch() {
+    local src=$1 dst=$2 root=$3
+    shift 3
+    local source="$src/$root" destination="$dst/$root" status=0
+
+    # A destination disk that dropped mid-run must not be recreated: on Unraid
+    # mkdir -p would build the path on the RAM-backed root, rsync would write
+    # there, and --remove-source-files would delete the only copies. $dst is
+    # the disk root; $destination is the path the mkdir below creates.
+    if [ ! -d "$dst" ]; then
+        failures=$((failures + 1))
+        echo "FAILED:  $dst is not mounted"
         return 1
     fi
 
-    echo "Finished: $folder_name"
+    mkdir -p "$destination"
 
+    rsync -avh --from0 --files-from="$SCRATCH/list" \
+        --ignore-existing --remove-source-files \
+        "$source/" "$destination/" || status=1
+
+    classify_batch "$source" "$destination"
+    MOVED=$((MOVED + CLASS_MOVED))
+    DUPLICATES=$((DUPLICATES + CLASS_DUPLICATES))
+
+    # A file at neither side did not arrive, whatever rsync said it did.
+    if [ "$status" -ne 0 ] || [ "$CLASS_FAILED" -ne 0 ]; then
+        FAILED_FILES=$((FAILED_FILES + CLASS_FAILED))
+        failures=$((failures + 1))
+        [ "$#" -gt 0 ] && prune_dirs "$@"
+        return 1
+    fi
+
+    [ "$#" -gt 0 ] && prune_dirs "$@"
+    return 0
+}
+
+# Walk the plan once, in sorted order, and hand each (source, target, root)
+# group to run_batch. The list is built in the loop, never through a pipeline:
+# a `... | sort` would run the loop in a subshell and lose the directories the
+# prune needs.
+run_batches() {
+    local rec prefix idx rest src dst root rel dir
+    local -a records=() dirs=()
+    local -A seen=()
+
+    [ "${#PLAN_REL[@]}" -gt 0 ] || return 0
+
+    if [ -z "$SCRATCH" ]; then
+        SCRATCH=$(mktemp -d) || { echo "ABORT: cannot create a scratch directory"; exit 2; }
+        trap 'rm -rf "$SCRATCH"' EXIT
+    fi
+
+    while IFS= read -r -d '' rec; do
+        records+=("$rec")
+    done < <(
+        for idx in "${!PLAN_REL[@]}"; do
+            printf '%s\x1f%s\x1f%s\x1f%s\0' \
+                "${PLAN_SRC[idx]}" "${PLAN_DST[idx]}" "${PLAN_ROOT[idx]}" "$idx"
+        done | sort -z -t $'\x1f' -k1,3
+    )
+
+    prefix=""
+    for rec in "${records[@]}"; do
+        idx=${rec##*$'\x1f'}
+        if [ "${rec%$'\x1f'*}" != "$prefix" ]; then
+            [ -n "$prefix" ] && run_batch "$src" "$dst" "$root" "${dirs[@]}"
+            prefix=${rec%$'\x1f'*}
+            src=${prefix%%$'\x1f'*}
+            rest=${prefix#*$'\x1f'}
+            dst=${rest%%$'\x1f'*}
+            root=${rest#*$'\x1f'}
+            : > "$SCRATCH/list"
+            dirs=()
+            seen=()
+        fi
+        rel=${PLAN_REL[idx]}
+        printf '%s\0' "$rel" >> "$SCRATCH/list"
+        # The unit's top-level folder, not the file's own directory: find starts
+        # there and -depth walks back up, so a parent that never held a file
+        # itself (Show/Season 01 above trickplay/0001) still disappears. The
+        # configured root is never passed, because every rel has a top folder.
+        if [ "$rel" != "${rel##*/}" ]; then
+            dir="$src/$root/${rel%%/*}"
+            if [ -z "${seen[$dir]:-}" ]; then
+                seen["$dir"]=1
+                dirs+=("$dir")
+            fi
+        fi
+    done
+    [ -n "$prefix" ] && run_batch "$src" "$dst" "$root" "${dirs[@]}"
+    return 0
+}
+
+# The four numbers the owner reads at the end of a run, then one line per unit
+# whose video sits on a disk other than its show's majority. Those files stay
+# where they are: expected, never an issue, never an exit-code change. A live run
+# also names every unit it skipped, because the run has finished by then and the
+# list is the only record of what it did not touch.
+print_report() {
+    local mode=$1 moved key disk unit n total=0 skipped
+    local -a lines=()
+
+    if [ "$mode" = "dry" ]; then
+        moved="${#PLAN_REL[@]} file(s) to move"
+    else
+        moved="$MOVED file(s) moved"
+    fi
+
+    for key in "${!LEFT_IN_PLACE[@]}"; do
+        n=$(( ${UNIT_FILES[$key]:-0} - ${UNIT_MOVING[$key]:-0} ))
+        total=$(( total + n ))
+        disk=${LEFT_IN_PLACE[$key]%%$'\x1f'*}
+        unit=${LEFT_IN_PLACE[$key]#*$'\x1f'}
+        lines+=("Left in place: $unit  (video on ${disk##*/}, $n file(s) stay there)")
+    done
+
+    echo
+    echo "REPORT: $moved"
+    skipped=$(( ${#REPORT_CONFLICTS[@]} + ${#REPORT_NO_VIDEO[@]} ))
+    echo "REPORT: $skipped unit(s) skipped for manual inspection  ($(( ${#REPORT_CONFLICTS[@]} )) conflict, $(( ${#REPORT_NO_VIDEO[@]} )) no video)"
+    echo "REPORT: $(( SKIPPED_FILES + total )) file(s) left in place"
+    echo "REPORT: $DUPLICATES file(s) already on the master, left on their own disk"
+
+    if [ "${#lines[@]}" -gt 0 ]; then
+        echo
+        printf '%s\n' "${lines[@]}" | sort
+    fi
+
+    if [ "$mode" = "live" ] &&
+        { [ "${#REPORT_CONFLICTS[@]}" -ne 0 ] || [ "${#REPORT_NO_VIDEO[@]}" -ne 0 ]; }; then
+        echo
+        echo "SKIPPED UNITS"
+        echo "These units were left untouched; their files are still on their own drives:"
+        printf '%s\n' "${REPORT_CONFLICTS[@]}" "${REPORT_NO_VIDEO[@]}" | sort
+    fi
 }
 
 # ----------------------------------------------------------
 # Scan each configured media directory
 # ----------------------------------------------------------
 
-# Counts movie/show folders whose transfer did not complete, so the run can exit
-# non-zero instead of reporting success over a partial move.
+# Counts groups whose transfer did not complete, so the run can exit non-zero
+# instead of reporting success over a partial move.
 failures=0
 
 for relative_path in "${FOLDERS[@]}"; do
@@ -277,8 +657,8 @@ for relative_path in "${FOLDERS[@]}"; do
     echo "Scanning: $relative_path"
     echo "=========================================="
 
-    # Collect folder names across all configured drives
-    declare -A folders=()
+    # Collect top-level folder names across all configured drives
+    TOPS=()
 
     for disk in "${DISKS[@]}"; do
 
@@ -287,7 +667,8 @@ for relative_path in "${FOLDERS[@]}"; do
         [ -d "$root" ] || continue
 
         while IFS= read -r -d '' name; do
-            folders["$name"]=1
+            TOPS["$name"]=1
+            TOP_PRESENT["$relative_path/$name"$'\x1f'"$disk"]=1
         done < <(
             find "$root" -mindepth 1 -maxdepth 1 \
                 -type d -printf '%f\0'
@@ -295,12 +676,29 @@ for relative_path in "${FOLDERS[@]}"; do
 
     done
 
-    # Process each movie/show folder
-    for folder_name in "${!folders[@]}"; do
-        process_folder "$relative_path" "$folder_name" || failures=$((failures + 1))
+    [ "${#TOPS[@]}" -gt 0 ] || continue
+
+    for disk in "${DISKS[@]}"; do
+        [ -d "$disk/$relative_path" ] || continue
+        index_videos "$disk" "$relative_path"
     done
 
-    unset folders
+    resolve_masters "$relative_path"
+
+    for disk in "${DISKS[@]}"; do
+        [ -d "$disk/$relative_path" ] || continue
+        index_files "$disk" "$relative_path"
+    done
+
+    # Clear, never unset: unset drops the associative attribute, and the next
+    # root would then read the path keys as arithmetic.
+    TOPS=()
+    TOP_PRESENT=()
+    TOP_VIDEO=()
+    TOP_OWN_VIDEO=()
+    SUB_VIDEO=()
+    TOP_MASTER=()
+    UNIT_MASTER=()
 
 done
 
@@ -309,6 +707,15 @@ echo "=========================================="
 echo " Consolidation scan complete"
 echo "=========================================="
 echo "Log:         $LOG_FILE"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    print_plan dry
+    print_report dry
+else
+    print_plan live
+    run_batches
+    print_report live
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
 
@@ -344,8 +751,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
 
 else
     if [ "$failures" -ne 0 ]; then
-        echo "Live consolidation finished with $failures failed folder(s)."
-        echo "See the FAILED lines above; re-run once the cause is fixed."
+        echo "Live consolidation finished with $failures failed batch(es) and $FAILED_FILES file(s) not moved."
+        # Only point at FAILED lines that exist: a batch stopped before rsync
+        # (an unmounted destination) prints one for the disk, not for each file.
+        if [ "$FAILED_FILES" -ne 0 ]; then
+            echo "See the FAILED lines above; re-run once the cause is fixed."
+        fi
         echo "=========================================="
         exit 1
     fi
