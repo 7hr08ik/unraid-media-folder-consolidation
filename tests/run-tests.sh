@@ -511,6 +511,29 @@ case_prunes_only_the_moved_folder() {
     end
 }
 
+# A prune must reach a parent that never held a file itself: the moved files sit
+# only in trickplay subdirectories, and the emptied movie folder must still go.
+case_prunes_a_parent_that_never_held_a_file() {
+    begin prunes-a-parent-that-never-held-a-file
+    make_disks 2
+    local d1="$CASE/disk1/Data/Movies/Lambda" d2="$CASE/disk2/Data/Movies/Lambda"
+    mkdir -p "$d1" "$d2/trickplay/0001" "$d2/trickplay/0002"
+    : > "$d1/Lambda.mkv"
+    : > "$d2/trickplay/0001/thumb.jpg"
+    : > "$d2/trickplay/0002/thumb.jpg"
+
+    prepare "$CASE" 0
+    run_and_log "$CASE"
+    local rc=$?
+
+    assert "exit 0"                    [ "$rc" -eq 0 ]
+    assert "thumbs arrived"            exists "$d1/trickplay/0001/thumb.jpg"
+    assert "second thumb arrived"      exists "$d1/trickplay/0002/thumb.jpg"
+    assert "whole source folder gone"  missing "$d2"
+    assert "master folder intact"      exists "$d1/Lambda.mkv"
+    end
+}
+
 # One rsync per disk pair, not one per folder: the stub counts its invocations.
 case_one_rsync_per_disk_pair() {
     begin one-rsync-per-disk-pair
@@ -548,12 +571,16 @@ case_failed_batch_keeps_sources_and_continues() {
         "$(command -v rsync)" > "$CASE/bin/rsync"
     chmod +x "$CASE/bin/rsync"
     prepare "$CASE" 0
-    run_and_log "$CASE" "$CASE/bin"
+    mkdir -p "$CASE/tmp"
+    # A private TMPDIR makes the scratch directory's lifetime observable.
+    ( TMPDIR="$CASE/tmp" run_and_log "$CASE" "$CASE/bin" )
     local rc=$?
     assert "exits 1"                [ "$rc" -eq 1 ]
+    assert "names the stuck file"   has "FAILED:  $CASE/disk2/Data/Movies/A/A.nfo"
     assert "failed source kept"     exists "$CASE/disk2/Data/Movies/A/A.nfo"
     assert "other pair still ran"   exists "$CASE/disk3/Data/Movies/B/B.nfo"
     assert "other source consumed"  missing "$CASE/disk2/Data/Movies/B/B.nfo"
+    assert "scratch cleaned up"     [ -z "$(ls -A "$CASE/tmp")" ]
     end
 }
 
@@ -1088,6 +1115,7 @@ case_failed_rsync_is_not_success
 case_invalid_dry_run_refuses_to_run
 case_absent_disk_is_not_fatal
 case_prunes_only_the_moved_folder
+case_prunes_a_parent_that_never_held_a_file
 case_one_rsync_per_disk_pair
 case_failed_batch_keeps_sources_and_continues
 case_opposite_direction_batches

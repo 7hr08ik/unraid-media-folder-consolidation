@@ -542,8 +542,12 @@ run_batches() {
         fi
         rel=${PLAN_REL[idx]}
         printf '%s\0' "$rel" >> "$SCRATCH/list"
+        # The unit's top-level folder, not the file's own directory: find starts
+        # there and -depth walks back up, so a parent that never held a file
+        # itself (Show/Season 01 above trickplay/0001) still disappears. The
+        # configured root is never passed, because every rel has a top folder.
         if [ "$rel" != "${rel##*/}" ]; then
-            dir="$src/$root/${rel%/*}"
+            dir="$src/$root/${rel%%/*}"
             if [ -z "${seen[$dir]:-}" ]; then
                 seen["$dir"]=1
                 dirs+=("$dir")
